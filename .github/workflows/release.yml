@@ -1,0 +1,50 @@
+name: Release Windows build
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install zip tools
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq zip unzip
+
+      - name: Download sing-box
+        shell: bash
+        run: |
+          SINGBOX_TAG="v1.14.3"
+          SINGBOX_VER="1.14.3"
+          curl -fL -o sb.zip "https://github.com/SagerNet/sing-box/releases/download/${SINGBOX_TAG}/sing-box-${SINGBOX_VER}-windows-amd64.zip"
+          unzip -o sb.zip
+          mkdir -p pkg/tools
+          mv "sing-box-${SINGBOX_VER}-windows-amd64/sing-box.exe" pkg/tools/
+
+      - name: Download wintun
+        shell: bash
+        run: |
+          curl -fL -o wintun.zip "https://www.wintun.net/builds/wintun-0.14.1.zip"
+          unzip -j -o wintun.zip "wintun/bin/amd64/wintun.dll" -d pkg/tools
+
+      - name: Assemble package
+        shell: bash
+        run: |
+          cp *.py pkg/
+          cp start.bat install.bat uninstall.bat README.txt pkg/
+          cd pkg
+          zip -r ../NikkiNet-windows-x64.zip .
+          cd ..
+          unzip -l NikkiNet-windows-x64.zip
+
+      - name: Create GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: NikkiNet-windows-x64.zip
+          generate_release_notes: true

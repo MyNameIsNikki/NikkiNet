@@ -1,0 +1,17 @@
+# Python
+__pycache__/
+*.pyc
+
+# Рантайм-файлы приложения (не входят в репозиторий)
+config.json
+geo.json
+.lock
+crash.log
+*.log
+.update/
+apply_update.bat
+tools/
+
+# Сборка
+dist/
+*.zip
