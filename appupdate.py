@@ -193,8 +193,8 @@ def _stage_zip(zip_path, base_dir):
 
 _APPLY_BAT_TEMPLATE = r"""@echo off
 rem ============================================================
-rem  NikkiNet: применение скачанного обновления.
-rem  Файл создан автоматически и удалит сам себя по завершении.
+rem  NikkiNet: apply downloaded update.
+rem  This file is generated automatically and deletes itself.
 rem ============================================================
 cd /d "%~dp0"
 set OLDPID=%%PID%%
