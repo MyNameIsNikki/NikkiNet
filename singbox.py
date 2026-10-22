@@ -31,6 +31,7 @@ OUTBOUND_TEST_TARGET = "example.com:80"
 
 CLASH_HOST = "127.0.0.1"
 CLASH_PORT = 9090
+LAN_PORT = 8889  # порт для локальной сети (только с логином/паролем)
 
 TAG_DIRECT = "direct"
 TAG_BLOCK = "block"
@@ -323,7 +324,7 @@ def proxy_group_tag(selection_mode):
     return TAG_AUTO if selection_mode == "auto" else TAG_MAIN
 
 
-def build_config(servers, active_id, rules, unmatched, vpn, proxy_port, selection_mode="manual"):
+def build_config(servers, active_id, rules, unmatched, vpn, proxy_port, selection_mode="manual", lan=None):
     outbounds = [
         {"type": "direct", "tag": TAG_DIRECT},
         {"type": "block", "tag": TAG_BLOCK},
@@ -367,6 +368,9 @@ def build_config(servers, active_id, rules, unmatched, vpn, proxy_port, selectio
     have_groups = bool(server_tags)
     outbounds.extend(groups)
 
+    lan = lan or {}
+    lan_on = bool(lan.get("enabled") and lan.get("username") and lan.get("password"))
+    # локальный порт всегда без пароля, чтобы не ломать системный прокси
     inbounds = [
         {
             "type": "mixed",
@@ -375,6 +379,15 @@ def build_config(servers, active_id, rules, unmatched, vpn, proxy_port, selectio
             "listen_port": proxy_port,
         }
     ]
+    if lan_on:
+        # отдельный порт для сети: без логина/пароля наружу не открывается
+        inbounds.append({
+            "type": "mixed",
+            "tag": "lan-in",
+            "listen": "0.0.0.0",
+            "listen_port": LAN_PORT,
+            "users": [{"username": str(lan["username"]), "password": str(lan["password"])}],
+        })
     if vpn:
         inbounds.append({
             "type": "tun",

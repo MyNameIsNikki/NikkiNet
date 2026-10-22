@@ -57,6 +57,7 @@ Filename: "{app}\{#AppExe}"; Description: "{cm:LaunchProgram,{#AppName}}"; Flags
 
 [UninstallRun]
 Filename: "{cmd}"; Parameters: "/C taskkill /F /IM sing-box.exe >nul 2>&1"; Flags: runhidden; RunOnceId: "KillSingBox"
+Filename: "netsh.exe"; Parameters: "advfirewall firewall delete rule name=""NikkiNet LAN proxy"""; Flags: runhidden; RunOnceId: "RemoveLanFirewallRule"
 Filename: "powershell.exe"; Parameters: "-NoProfile -ExecutionPolicy Bypass -Command ""try {{ Remove-MpPreference -ExclusionPath '{app}' -ErrorAction SilentlyContinue }} catch {{}}"""; Flags: runhidden; RunOnceId: "RemoveDefenderExcl"
 
 [UninstallDelete]

@@ -215,6 +215,24 @@ ADMIN_HTML = """<!DOCTYPE html>
     </div>
 
     <div class="card">
+      <h2>Доступ из локальной сети</h2>
+      <div class="row">
+        <label class="switch"><input type="checkbox" id="lan-toggle" onchange="setLan(this.checked)"> Разрешить другим устройствам</label>
+        <span class="tag" id="lan-state">выключен</span>
+      </div>
+      <div id="lan-box" class="hidden" style="margin-top:12px">
+        <div class="row">
+          <span class="span">Адрес:</span><b class="ok" id="lan-addr">—</b>
+          <span class="span">Логин:</span><input id="lan-user" style="width:130px" autocomplete="off">
+          <span class="span">Пароль:</span><input id="lan-pass" style="width:170px" autocomplete="off">
+          <button onclick="genLanPass()">Новый пароль</button>
+          <button class="primary" onclick="saveLanCreds()">Применить</button>
+        </div>
+        <div class="muted" style="margin-top:8px">На телефоне или другом ПК в той же Wi-Fi сети укажите этот адрес как HTTP-прокси и введите логин с паролем. Порт открыт только для локальной подсети и только пока режим включён. Веб-панель по-прежнему доступна только с этого компьютера.</div>
+      </div>
+    </div>
+
+    <div class="card">
       <h2 style="display:flex;align-items:center;gap:10px;flex-wrap:wrap">Серверы <span class="muted" id="srv-sort-note" style="font-weight:400">(отсортированы по пингу; &gt;1500мс отбрасываются)</span>
         <select id="country-filter" onchange="this.dataset.v=this.value;renderServers()" style="margin-left:auto;max-width:300px" title="Фильтр по стране"></select>
       </h2>
@@ -355,11 +373,12 @@ async function refresh(){
   document.getElementById('core-status').innerHTML=state.core.running
     ?'<span class="dot ok-dot"></span><span class="ok">движок работает</span>'
     :'<span class="dot err-dot"></span><span class="err">'+(state.core.error?('движок: '+esc(state.core.error.slice(0,40))):'движок: не запущен')+'</span>';
-  document.getElementById('listener-note').textContent='Локальный прокси: 127.0.0.1:8888 · Веб-панель: '+state.admin+' · Режим неопознанного трафика: '+state.unmatched;
+  document.getElementById('listener-note').textContent='Локальный прокси: '+((state.lan&&state.lan.enabled)?((state.lan_ip||'?')+':'+(state.lan_port||8889)+', с логином и паролем)'):'127.0.0.1:8888')+' · Веб-панель: '+state.admin+' · Режим неопознанного трафика: '+state.unmatched;
   document.querySelectorAll('#mode-seg button').forEach(b=>b.classList.toggle('on',b.dataset.m===state.unmatched));
   document.querySelectorAll('#sel-seg button').forEach(b=>b.classList.toggle('on',b.dataset.s===state.selection_mode));
   document.getElementById('sp-toggle').checked=!!state.system_proxy;
   document.getElementById('vpn-toggle').checked=!!state.vpn;
+  renderLan();
   renderServers(); renderQC(); renderSubs(); renderRules();
   }catch(e){toast('refresh: '+e.message);}
 }
@@ -461,6 +480,38 @@ async function setMode(m){try{await api('/api/mode','POST',{unmatched:m});refres
 async function setSelMode(m){try{await api('/api/mode','POST',{selection_mode:m});refresh();}catch(e){toast(e.message);}}
 async function setSystemProxy(v){try{await api('/api/system-proxy','POST',{enabled:v});refresh();}catch(e){document.getElementById('sp-toggle').checked=!v;toast(e.message);}}
 async function setVpn(v){try{const r=await api('/api/vpn','POST',{enabled:v});if(r.relaunching){toast(r.message||'Перезапуск...');return;}refresh();}catch(e){document.getElementById('vpn-toggle').checked=!v;toast(e.message);}}
+function renderLan(){
+  const l=state.lan||{};
+  document.getElementById('lan-toggle').checked=!!l.enabled;
+  const tag=document.getElementById('lan-state');
+  tag.textContent=l.enabled?'включён':'выключен';
+  tag.className='tag'+(l.enabled?' ok':'');
+  document.getElementById('lan-box').classList.toggle('hidden',!l.enabled);
+  document.getElementById('lan-addr').textContent=l.enabled?((state.lan_ip||'—')+':'+(state.lan_port||8889)):'—';
+  const u=document.getElementById('lan-user'),p=document.getElementById('lan-pass');
+  if(document.activeElement!==u&&u.value!==(l.username||''))u.value=l.username||'';
+  if(document.activeElement!==p&&p.value!==(l.password||''))p.value=l.password||'';
+}
+function lanForm(){return {username:document.getElementById('lan-user').value.trim(),password:document.getElementById('lan-pass').value};}
+async function setLan(v){
+  try{
+    const r=await api('/api/lan','POST',Object.assign({enabled:v},lanForm()));
+    if(r.warning){toast(r.warning);}
+    else if(v&&r.lan){toast('Доступ из сети: '+r.address+' · '+r.lan.username+' / '+r.lan.password);}
+    refresh();
+  }catch(e){document.getElementById('lan-toggle').checked=!v;toast(e.message);}
+}
+async function saveLanCreds(){
+  try{
+    const r=await api('/api/lan','POST',Object.assign({enabled:true},lanForm()));
+    if(r.warning){toast(r.warning);}else{toast('Сохранено: '+r.address);}
+    refresh();
+  }catch(e){toast(e.message);}
+}
+function genLanPass(){
+  const a='abcdefghijkmnpqrstuvwxyzABCDEFGHJKLMNPQRSTUVWXYZ23456789';let s='';for(let i=0;i<12;i++)s+=a[Math.floor(Math.random()*a.length)];
+  document.getElementById('lan-pass').value=s;
+}
 async function reloadCore(){try{await api('/api/reload','POST',{});refresh();}catch(e){toast(e.message);}}
 async function appExit(){
   if(!confirm('Полностью выключить приложение? Прокси и панель остановятся.'))return;

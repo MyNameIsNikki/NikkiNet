@@ -24,6 +24,9 @@ taskkill /PID %OLDPID% /F >nul 2>&1
 taskkill /IM sing-box.exe /F >nul 2>&1
 timeout /t 2 /nobreak >nul
 
+rem remove the LAN proxy firewall rule (if it was enabled)
+powershell -NoProfile -Command "Remove-NetFirewallRule -DisplayName 'NikkiNet LAN proxy' -ErrorAction SilentlyContinue" >nul 2>&1
+
 rem make sure the system proxy is not left enabled
 reg add "HKCU\Software\Microsoft\Windows\CurrentVersion\Internet Settings" /v ProxyEnable /t REG_DWORD /d 0 /f >nul 2>&1
 

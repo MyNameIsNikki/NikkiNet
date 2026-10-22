@@ -3,6 +3,7 @@ import json
 import os
 import random
 import re
+import secrets
 import socket as _socket
 import subprocess
 import sys
@@ -117,6 +118,7 @@ class State:
     selection_mode: str = "manual"
     system_proxy: bool = False
     vpn: bool = False
+    lan: dict = None
     connected_since: float = 0.0
     orig_proxy: dict = None
     warp_reg: dict = None
@@ -171,6 +173,7 @@ def load_state():
             st.connected_since = float(data.get("connected_since") or 0.0)
             st.orig_proxy = data.get("orig_proxy")
             st.warp_reg = data.get("warp_reg")
+            st.lan = _norm_lan(data.get("lan"))
             if not st.servers:
                 return default_state()
             if not st.server(st.active_server_id):
@@ -195,6 +198,7 @@ def save_state(state):
             "connected_since": state.connected_since,
             "orig_proxy": state.orig_proxy,
             "warp_reg": state.warp_reg,
+            "lan": state.lan or {},
         }
     try:
         with open(CONFIG_FILE, "w", encoding="utf-8") as fh:
@@ -203,9 +207,130 @@ def save_state(state):
         print("save_state error:", exc)
 
 
+LAN_USER_DEFAULT = "nikki"
+LAN_FW_RULE = "NikkiNet LAN proxy"
+
+
+def _norm_lan(d):
+    d = d if isinstance(d, dict) else {}
+    user = str(d.get("username") or "").strip()[:32]
+    pw = str(d.get("password") or "")[:64]
+    return {"enabled": bool(d.get("enabled")) and bool(user) and bool(pw),
+            "username": user, "password": pw}
+
+
+def gen_lan_password(n=12):
+    alphabet = "abcdefghijkmnpqrstuvwxyzABCDEFGHJKLMNPQRSTUVWXYZ23456789"
+    return "".join(secrets.choice(alphabet) for _ in range(n))
+
+
+_VIRTUAL_ADAPTER = re.compile(
+    r"vEthernet|WSL|Docker|Hyper-V|VirtualBox|VMware|Loopback|Tailscale|ZeroTier|"
+    r"Radmin|OpenVPN|WireGuard|Xray|happ|TAP-|Npcap|Bluetooth|\bVPN\b",
+    re.I,
+)
+
+
+def _private_rank(ip):
+    """0/1/2 — приоритет домашних сетей; -1 — не приватный IPv4."""
+    try:
+        p = [int(x) for x in str(ip).split(".")]
+    except Exception:
+        return -1
+    if len(p) != 4 or any(b < 0 or b > 255 for b in p):
+        return -1
+    if p[0] == 192 and p[1] == 168:
+        return 0
+    if p[0] == 10:
+        return 1
+    if p[0] == 172 and 16 <= p[1] <= 31:
+        return 2
+    return -1
+
+
+_LAN_IP_CACHE = {"ts": 0.0, "ip": ""}
+
+
+def _detect_lan_ip():
+    """Быстрое определение адреса в локальной сети (адаптер с маршрутом по умолчанию)."""
+    if IS_WINDOWS:
+        best = None
+        try:
+            ps = ("$idx = (Get-NetRoute -DestinationPrefix '0.0.0.0/0' -ErrorAction SilentlyContinue).ifIndex; "
+                  "Get-NetIPAddress -AddressFamily IPv4 -ErrorAction SilentlyContinue | "
+                  "Where-Object { $idx -contains $_.InterfaceIndex } | "
+                  "ForEach-Object { $_.IPAddress + '|' + $_.InterfaceAlias }")
+            r = subprocess.run(
+                ["powershell", "-NoProfile", "-NonInteractive", "-Command", ps],
+                capture_output=True, text=True, timeout=8, creationflags=CREATE_NO_WINDOW,
+            )
+            for line in (r.stdout or "").splitlines():
+                line = line.strip()
+                if "|" not in line:
+                    continue
+                ip, alias = line.split("|", 1)
+                if _VIRTUAL_ADAPTER.search(alias):
+                    continue
+                rank = _private_rank(ip)
+                if rank >= 0 and (best is None or rank < best[0]):
+                    best = (rank, ip)
+        except Exception:
+            best = None
+        if best:
+            return best[1]
+    # запасной вариант: адрес источника маршрута по умолчанию
+    try:
+        s = _socket.socket(_socket.AF_INET, _socket.SOCK_DGRAM)
+        try:
+            s.connect(("8.8.8.8", 80))
+            return s.getsockname()[0]
+        finally:
+            s.close()
+    except Exception:
+        return ""
+
+
+def lan_ip(force=False):
+    """Кэшированный адрес машины в локальной сети."""
+    now = time.time()
+    if not force and _LAN_IP_CACHE["ip"] and now - _LAN_IP_CACHE["ts"] < 60:
+        return _LAN_IP_CACHE["ip"]
+    ip = _detect_lan_ip()
+    _LAN_IP_CACHE["ip"] = ip
+    _LAN_IP_CACHE["ts"] = now
+    return ip
+
+
+def _firewall_lan(add):
+    """Открыть/закрыть TCP-порт прокси, только для локальной подсети."""
+    if not IS_WINDOWS:
+        return False, "только Windows"
+    name = LAN_FW_RULE
+    if add:
+        ps = ("$ErrorActionPreference='Stop'; "
+              f"Get-NetFirewallRule -DisplayName '{name}' -ErrorAction SilentlyContinue | "
+              "Remove-NetFirewallRule -ErrorAction SilentlyContinue; "
+              f"New-NetFirewallRule -DisplayName '{name}' -Direction Inbound -Action Allow "
+              f"-Protocol TCP -LocalPort {core_mod.LAN_PORT} -RemoteAddress LocalSubnet -Profile Any | Out-Null")
+    else:
+        ps = (f"Get-NetFirewallRule -DisplayName '{name}' -ErrorAction SilentlyContinue | "
+              "Remove-NetFirewallRule -ErrorAction SilentlyContinue")
+    try:
+        r = subprocess.run(
+            ["powershell", "-NoProfile", "-NonInteractive", "-Command", ps],
+            capture_output=True, text=True, timeout=30, creationflags=CREATE_NO_WINDOW,
+        )
+        if r.returncode != 0:
+            return False, (r.stderr or r.stdout or "powershell error").strip()[:300]
+        return True, ""
+    except Exception as exc:
+        return False, str(exc)[:300]
+
+
 def do_reload(state, force=False):
     cfg = core_mod.build_config(
-        state.servers, state.active_server_id, state.rules, state.unmatched, state.vpn, LISTEN_PORT, state.selection_mode
+        state.servers, state.active_server_id, state.rules, state.unmatched, state.vpn, LISTEN_PORT,
+        state.selection_mode, lan=state.lan
     )
     return state.core.start(cfg, LISTEN_PORT, force=force)
 
@@ -247,7 +372,8 @@ class Reloader:
             return
         for _attempt in range(4):
             cfg = core_mod.build_config(
-                st.servers, st.active_server_id, st.rules, st.unmatched, st.vpn, LISTEN_PORT, st.selection_mode
+                st.servers, st.active_server_id, st.rules, st.unmatched, st.vpn, LISTEN_PORT,
+                st.selection_mode, lan=st.lan
             )
             running = bool(st.core.running and st.core.proc and st.core.proc.poll() is None)
             if not force and running and st.core.cfg_hash == core_mod.config_hash(cfg):
@@ -860,9 +986,13 @@ class AdminHandler(BaseHTTPRequestHandler):
             "group_mode": core_mod.proxy_group_tag(state.selection_mode),
             "system_proxy": state.system_proxy,
             "vpn": state.vpn,
+            "lan": _norm_lan(state.lan),
+            "lan_ip": lan_ip(),
+            "lan_port": core_mod.LAN_PORT,
+            "listen_port": LISTEN_PORT,
             "connected_since": state.connected_since,
             "admin": f"{ADMIN_HOST}:{ADMIN_PORT}",
-            "listen": f"{LISTEN_HOST}:{LISTEN_PORT}",
+            "listen": f"{'0.0.0.0' if _norm_lan(state.lan)['enabled'] else LISTEN_HOST}:{LISTEN_PORT}",
             "core": state.core.status() if state.core else {"running": False, "error": "ядро не инициализировано"},
             "tools_ready": core_mod.tools_ready(),
             "is_admin": is_admin(),
@@ -1246,6 +1376,43 @@ class AdminHandler(BaseHTTPRequestHandler):
             save_state(state)
             return {"ok": True, "vpn": enabled}
 
+        if p == "/api/lan":
+            want = bool(b.get("enabled"))
+            cur = _norm_lan(state.lan)
+            user = str(b.get("username") if b.get("username") is not None else cur["username"]).strip()[:32]
+            pw = str(b.get("password") if b.get("password") is not None else cur["password"])[:64]
+            if not user:
+                user = LAN_USER_DEFAULT
+            if want:
+                if len(user) < 2:
+                    return {"ok": False, "error": "Логин должен быть не короче 2 символов"}
+                if not pw:
+                    pw = gen_lan_password()
+                if len(pw) < 6:
+                    return {"ok": False, "error": "Пароль должен быть не короче 6 символов"}
+            prev = state.lan
+            new = {"enabled": want, "username": user, "password": pw}
+            state.lan = new
+            ok, msg = do_reload(state, force=True)
+            if not ok:
+                state.lan = prev
+                do_reload(state, force=True)
+                return {"ok": False, "error": msg[:250]}
+            fw_ok, fw_err = _firewall_lan(want)
+            save_state(state)
+            if want:
+                state.add_log("info", f"Доступ из локальной сети включён: {user}@{lan_ip()}:{core_mod.LAN_PORT}")
+            else:
+                state.add_log("info", "Доступ из локальной сети выключен")
+            res = {"ok": True, "lan": new, "address": f"{lan_ip()}:{core_mod.LAN_PORT}"}
+            if want and not fw_ok:
+                if not is_admin():
+                    res["warning"] = ("Доступ включён, но порт не открыт в брандмауэре: "
+                                      "запустите NikkiNet от имени администратора.")
+                else:
+                    res["warning"] = "Доступ включён, но правило брандмауэра не создано: " + fw_err[:160]
+            return res
+
         if p == "/api/reload":
             if state.reloader:
                 state.reloader.request(force=True)
@@ -1390,6 +1557,14 @@ def run():
 
     do_reload(state, force=True)
 
+    _lan = _norm_lan(state.lan)
+    if _lan["enabled"]:
+        fw_ok, fw_err = _firewall_lan(True)
+        if fw_ok:
+            state.add_log("info", f"Доступ из локальной сети: {_lan['username']}@{lan_ip()}:{core_mod.LAN_PORT}")
+        else:
+            state.add_log("error", f"Доступ из сети: правило брандмауэра не создано ({fw_err})")
+
     if state.system_proxy:
         ok, msg = set_system_proxy(True, f"{LISTEN_HOST}:{LISTEN_PORT}", state=state)
         state.add_log("info" if ok else "error", "Системный прокси восстановлен" if ok else f"Системный прокси: {msg}")
@@ -1416,6 +1591,8 @@ def run():
     print(" Proxy Manager (Nekoray/HApp-стиль)")
     print(f"  Версия: v{version.APP_VERSION} · обновления: github.com/{version.GITHUB_REPO}")
     print(f"  Локальный прокси: http://{LISTEN_HOST}:{LISTEN_PORT}  (http/socks mixed)")
+    if _lan["enabled"]:
+        print(f"  Для локальной сети: {lan_ip()}:{core_mod.LAN_PORT}  (логин {_lan['username']}, пароль задан)")
     print(f"  Веб-панель:       http://{ADMIN_HOST}:{ADMIN_PORT}")
     print("  Настройте браузер на прокси 127.0.0.1:8888")
     print("=" * 60)
