@@ -208,7 +208,7 @@ if %errorlevel% equ 0 (
 ping -n 3 127.0.0.1 >nul
 taskkill /IM sing-box.exe /F >nul 2>&1
 
-robocopy ".update" "." /MIR /R:2 /W:1 /NFL /NDL /NJH /NJS /NP /XD .update __pycache__ .git .github /XF config.json geo.json .lock crash.log *.log apply_update.bat sing-box-config.json test-*.json .gitignore README.md >nul
+robocopy ".update" "." /E /R:2 /W:1 /NFL /NDL /NJH /NJS /NP /XD .update __pycache__ .git .github /XF config.json geo.json .lock crash.log *.log apply_update.bat sing-box-config.json test-*.json .gitignore README.md >nul
 
 start "" "%~dp0start.bat"
 ping -n 4 127.0.0.1 >nul
