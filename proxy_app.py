@@ -1,4 +1,5 @@
 import ctypes
+import base64
 import json
 import os
 import random
@@ -211,6 +212,11 @@ LAN_USER_DEFAULT = "nikki"
 LAN_FW_RULE = "NikkiNet LAN proxy"
 
 
+def _b64_ps(script):
+    """PowerShell -EncodedCommand принимает UTF-16LE base64."""
+    return base64.b64encode(script.encode("utf-16-le")).decode("ascii")
+
+
 def _norm_lan(d):
     d = d if isinstance(d, dict) else {}
     user = str(d.get("username") or "").strip()[:32]
@@ -261,7 +267,7 @@ def _detect_lan_ip():
                   "Where-Object { $idx -contains $_.InterfaceIndex } | "
                   "ForEach-Object { $_.IPAddress + '|' + $_.InterfaceAlias }")
             r = subprocess.run(
-                ["powershell", "-NoProfile", "-NonInteractive", "-Command", ps],
+                ["powershell", "-NoProfile", "-NonInteractive", "-WindowStyle", "Hidden", "-Command", ps],
                 capture_output=True, text=True, timeout=8, creationflags=CREATE_NO_WINDOW,
             )
             for line in (r.stdout or "").splitlines():
@@ -306,25 +312,87 @@ def _firewall_lan(add):
     if not IS_WINDOWS:
         return False, "только Windows"
     name = LAN_FW_RULE
-    if add:
-        ps = ("$ErrorActionPreference='Stop'; "
+    if not add:
+        ps = (f"Get-NetFirewallRule -DisplayName '{name}' -ErrorAction SilentlyContinue | "
+              "Remove-NetFirewallRule -ErrorAction SilentlyContinue")
+        try:
+            subprocess.run(
+                ["powershell", "-NoProfile", "-NonInteractive", "-WindowStyle", "Hidden", "-Command", ps],
+                capture_output=True, text=True, timeout=30, creationflags=CREATE_NO_WINDOW,
+            )
+        except Exception:
+            pass
+        return True, ""
+    return _firewall_lan_add(name)
+
+
+def _firewall_lan_add(name):
+    """Правило без прав администратора не создать: пробуем elevated со скрытым окном."""
+    ps_check = (f"$r = Get-NetFirewallRule -DisplayName '{name}' -ErrorAction SilentlyContinue; "
+                "if ($r) { $r | Get-NetFirewallPortFilter | ForEach-Object { $_.LocalPort } }")
+    port = str(core_mod.LAN_PORT)
+    try:
+        r = subprocess.run(
+            ["powershell", "-NoProfile", "-NonInteractive", "-WindowStyle", "Hidden", "-Command", ps_check],
+            capture_output=True, text=True, timeout=20, creationflags=CREATE_NO_WINDOW,
+        )
+        if port in (r.stdout or "") and "LocalSubnet" in _rule_remote_address(name):
+            return True, ""
+    except Exception:
+        pass
+    ps_add = ("$ErrorActionPreference='Stop'; "
               f"Get-NetFirewallRule -DisplayName '{name}' -ErrorAction SilentlyContinue | "
               "Remove-NetFirewallRule -ErrorAction SilentlyContinue; "
               f"New-NetFirewallRule -DisplayName '{name}' -Direction Inbound -Action Allow "
               f"-Protocol TCP -LocalPort {core_mod.LAN_PORT} -RemoteAddress LocalSubnet -Profile Any | Out-Null")
-    else:
-        ps = (f"Get-NetFirewallRule -DisplayName '{name}' -ErrorAction SilentlyContinue | "
-              "Remove-NetFirewallRule -ErrorAction SilentlyContinue")
+    return _ps_elevated(ps_add, "NikkiNet")
+
+
+def _rule_remote_address(name):
+    ps = (f"Get-NetFirewallRule -DisplayName '{name}' -ErrorAction SilentlyContinue | "
+          "Get-NetFirewallAddressFilter | ForEach-Object { $_.RemoteAddress }")
     try:
         r = subprocess.run(
-            ["powershell", "-NoProfile", "-NonInteractive", "-Command", ps],
-            capture_output=True, text=True, timeout=30, creationflags=CREATE_NO_WINDOW,
+            ["powershell", "-NoProfile", "-NonInteractive", "-WindowStyle", "Hidden", "-Command", ps],
+            capture_output=True, text=True, timeout=20, creationflags=CREATE_NO_WINDOW,
         )
-        if r.returncode != 0:
-            return False, (r.stderr or r.stdout or "powershell error").strip()[:300]
-        return True, ""
+        return r.stdout or ""
+    except Exception:
+        return ""
+
+
+def _ps_elevated(ps, tag):
+    """Выполнить PowerShell от администратора: сначала молча (UAC один раз), при отказе — видимое окно."""
+    inner = ("$e = $null; try { " + ps + " } catch { $e = $_.Exception.Message }; "
+             "if ($e) { Write-Host $e; exit 1 }")
+    b64 = _b64_ps(inner)
+    hidden = (f"try {{ $p = Start-Process -FilePath 'powershell.exe' -Verb RunAs -WindowStyle Hidden "
+              f"-ArgumentList '-NoProfile','-NonInteractive','-EncodedCommand','{b64}' -Wait -PassThru; "
+              "exit $p.ExitCode } catch { exit 2 }")
+    try:
+        r = subprocess.run(
+            ["powershell", "-NoProfile", "-NonInteractive", "-WindowStyle", "Hidden", "-Command", hidden],
+            capture_output=True, text=True, timeout=120, creationflags=CREATE_NO_WINDOW,
+        )
+        if r.returncode == 0:
+            return True, ""
+        if r.returncode == 2:
+            return False, "нужны права администратора: запустите NikkiNet от имени администратора"
     except Exception as exc:
-        return False, str(exc)[:300]
+        return False, str(exc)[:200]
+    # не сработало молча — пробуем показать окно UAC/ошибки
+    visible = (f"Start-Process -FilePath 'powershell.exe' -Verb RunAs "
+               f"-ArgumentList '-NoProfile','-EncodedCommand','{b64}' -Wait")
+    try:
+        r = subprocess.run(
+            ["powershell", "-NoProfile", "-Command", visible],
+            capture_output=True, text=True, timeout=300, creationflags=CREATE_NO_WINDOW,
+        )
+        if r.returncode == 0:
+            return True, ""
+        return False, (r.stderr or r.stdout or "правило не создано").strip()[:200]
+    except Exception as exc:
+        return False, str(exc)[:200]
 
 
 def do_reload(state, force=False):
@@ -1406,11 +1474,7 @@ class AdminHandler(BaseHTTPRequestHandler):
                 state.add_log("info", "Доступ из локальной сети выключен")
             res = {"ok": True, "lan": new, "address": f"{lan_ip()}:{core_mod.LAN_PORT}"}
             if want and not fw_ok:
-                if not is_admin():
-                    res["warning"] = ("Доступ включён, но порт не открыт в брандмауэре: "
-                                      "запустите NikkiNet от имени администратора.")
-                else:
-                    res["warning"] = "Доступ включён, но правило брандмауэра не создано: " + fw_err[:160]
+                res["warning"] = ("Доступ включён, но порт не открыт в брандмауэре: " + fw_err[:160])
             return res
 
         if p == "/api/reload":
