@@ -21,3 +21,6 @@ installer/.build/
 installer/.downloaded/
 installer/Output/
 installer/preview.png
+
+# Экспорт серверов для Android (содержит ваши ссылки/подписки)
+android/

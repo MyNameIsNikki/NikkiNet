@@ -35,6 +35,33 @@ http://127.0.0.1:8000
 Удаление: «Параметры → Приложения → NikkiNet → Удалить» (для установщика)
 или `uninstall.bat` (для архива).
 
+## Android
+
+Отдельного `.apk` у NikkiNet нет: приложение использует Windows-компоненты
+(`sing-box.exe`, `wintun.dll`, системный прокси). На телефоне ставится тот же
+движок sing-box в готовом Android-клиенте:
+
+- **v2rayNG** — https://github.com/2dust/v2rayNG/releases
+- **SFA (sing-box for Android)** — https://github.com/SagerNet/sing-box-for-android/releases
+
+Перенос серверов с компьютера (скрипт не требует зависимостей):
+
+```bash
+python export_android.py
+```
+
+Он создаёт:
+
+- `android/subscriptions.txt` — URL ваших подписок (в клиенте:
+  «Группы» → «+» → Subscription → вставить URL; серверы будут обновляться сами)
+- `android/links.txt` — share-ссылки `vless://`, `vmess://`, `trojan://`,
+  `ss://`, `hysteria2://` по одной в строке (в клиенте: «+» → «Импорт из
+  буфера обмена»)
+
+Публичные HTTP/SOCKS-прокси из бесплатных списков переносятся только через
+подписки. Не используйте их для банков, почты и других чувствительных данных:
+владелец такого прокси технически видит ваш трафик.
+
 ## Автообновление
 
 Приложение проверяет релизы в этом репозитории раз в 6 часов и при открытии
@@ -78,6 +105,7 @@ python installer/make_icon.py
 | `ui.py` | веб-панель (один HTML-файл) |
 | `version.py` | версия приложения + репозиторий обновлений |
 | `appupdate.py` | проверка релизов и самообновление |
+| `export_android.py` | экспорт серверов и подписок для Android (v2rayNG/SFA) |
 | `install.bat` / `start.bat` / `uninstall.bat` | установка / запуск / удаление |
 | `installer/nikkinet.iss` | скрипт установщика (Inno Setup) |
 | `installer/build_dist.ps1` | сборка дистрибутива и `NikkiNet-Setup.exe` |
