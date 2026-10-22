@@ -233,6 +233,18 @@ ADMIN_HTML = """<!DOCTYPE html>
     </div>
 
     <div class="card">
+      <h2>Автосбор серверов из интернета</h2>
+      <div class="row">
+        <button class="primary" onclick="startParse('internet')">Собрать из интернета</button>
+        <button onclick="startParse('lists')">Собрать из списков</button>
+        <label class="switch"><input type="checkbox" id="np-deep" checked> Проверять через sing-box</label>
+        <span class="tag" id="np-phase">ожидание</span>
+      </div>
+      <div class="muted" id="np-status" style="margin-top:8px">Соберёт серверы из GitHub-списков, публичных сайтов и seeds.txt, проверит их и добавит рабочие в NikkiNet. Без галочки проверки остаются только TCP-отклики — они часто не работают как прокси.</div>
+      <div id="np-log" class="hidden" style="margin-top:8px;max-height:160px;overflow:auto;font-size:11px;white-space:pre-wrap"></div>
+    </div>
+
+    <div class="card">
       <h2 style="display:flex;align-items:center;gap:10px;flex-wrap:wrap">Серверы <span class="muted" id="srv-sort-note" style="font-weight:400">(отсортированы по пингу; &gt;1500мс отбрасываются)</span>
         <select id="country-filter" onchange="this.dataset.v=this.value;renderServers()" style="margin-left:auto;max-width:300px" title="Фильтр по стране"></select>
       </h2>
@@ -512,6 +524,32 @@ function genLanPass(){
   const a='abcdefghijkmnpqrstuvwxyzABCDEFGHJKLMNPQRSTUVWXYZ23456789';let s='';for(let i=0;i<12;i++)s+=a[Math.floor(Math.random()*a.length)];
   document.getElementById('lan-pass').value=s;
 }
+let npTimer=null;
+async function startParse(mode){
+  try{
+    const deep=document.getElementById('np-deep').checked;
+    const r=await api('/api/parse/start','POST',{mode:mode,deep:deep});
+    if(!r.ok){toast(r.error||'Не удалось запустить сбор');return;}
+    toast(mode==='internet'?'Сбор из интернета запущен':'Сбор из списков запущен');
+    npPoll();
+  }catch(e){toast(e.message);}
+}
+async function npPoll(){
+  try{
+    const s=await api('/api/parse/status');
+    const ph=document.getElementById('np-phase');
+    ph.textContent=s.phase||(s.running?'работает':'ожидание');
+    ph.className='tag'+(s.running?' ok':'');
+    document.getElementById('np-status').textContent='Найдено: '+(s.found||0)+' · живы по TCP: '+(s.alive||0)+' · рабочие: '+(s.working||0)+' · добавлено: '+(s.added||0)+(s.message?' · '+s.message:'');
+    const log=document.getElementById('np-log');
+    const lines=(s.log||[]).slice(-8);
+    log.innerHTML=lines.map(esc).join('<br>');
+    log.classList.toggle('hidden',lines.length===0);
+    clearTimeout(npTimer);
+    if(s.running){npTimer=setTimeout(npPoll,2000);}else{refresh();}
+  }catch(e){clearTimeout(npTimer);npTimer=setTimeout(npPoll,5000);}
+}
+npPoll();
 async function reloadCore(){try{await api('/api/reload','POST',{});refresh();}catch(e){toast(e.message);}}
 async function appExit(){
   if(!confirm('Полностью выключить приложение? Прокси и панель остановятся.'))return;

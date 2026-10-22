@@ -17,6 +17,7 @@ from dataclasses import dataclass, field
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import appupdate
+import netparse
 import singbox as core_mod
 import subs as subs_mod
 import version
@@ -956,6 +957,20 @@ def _apply_update_async(state):
     threading.Thread(target=worker, daemon=True).start()
 
 
+def _start_autoparse(state, opts):
+    """Запускает фоновый автосбор и добавляет найденные серверы в NikkiNet."""
+    def on_done(servers):
+        added = add_servers(state, servers, source="autoparse")
+        if added and state.reloader:
+            state.reloader.request()
+        save_state(state)
+        state.add_log("info", f"Автосбор: добавлено {len(added)} серверов")
+        return len(added)
+
+    ok, err = netparse.start(opts, on_done)
+    return {"ok": ok, "error": err, "status": netparse.status()}
+
+
 # ---------- web ----------
 
 class AdminServer(ThreadingHTTPServer):
@@ -1035,6 +1050,8 @@ class AdminHandler(BaseHTTPRequestHandler):
             self._json({"lines": txt.splitlines()[-120:]})
         elif self.path == "/api/update/status":
             self._json(appupdate.status())
+        elif self.path == "/api/parse/status":
+            self._json(netparse.status())
         else:
             self.send_error(404)
 
@@ -1091,6 +1108,29 @@ class AdminHandler(BaseHTTPRequestHandler):
                 return {"ok": False, "error": "нет доступного обновления"}
             _apply_update_async(state)
             return {"ok": True, "message": "обновление скачивается, приложение перезапустится"}
+
+        if p == "/api/parse/start":
+            mode = b.get("mode") if b.get("mode") in ("internet", "lists") else "internet"
+
+            def clamp(name, default, low, high):
+                try:
+                    value = int(b.get(name, default))
+                except (TypeError, ValueError):
+                    value = default
+                return max(low, min(high, value))
+
+            opts = {
+                "mode": mode,
+                "deep": bool(b.get("deep", True)),
+                "max_pages": clamp("max_pages", 40, 5, 150),
+                "per_source": clamp("per_source", 250, 20, 600),
+                "max_total": clamp("max_total", 1200, 100, 4000),
+                "deep_limit": clamp("deep_limit", 300, 10, 2000),
+            }
+            res = _start_autoparse(state, opts)
+            if res.get("ok"):
+                state.add_log("info", "Автосбор серверов запущен")
+            return res
 
         if p == "/api/server/add":
             text = b.get("text")
