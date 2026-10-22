@@ -28,6 +28,8 @@ exit /b 1
 
 :run
 rem ===== 2. Find a working Python 3.8+ =====
+rem Bundled runtime (installed by NikkiNet-Setup.exe) comes first
+if exist "%~dp0python.exe" goto runbundled
 set "PYCMD="
 python -c "import sys; sys.exit(0 if sys.version_info >= (3, 8) else 1)" >nul 2>&1
 if %errorlevel% equ 0 set "PYCMD=python" & goto runapp
@@ -57,12 +59,22 @@ echo.
 pause
 exit /b 1
 
+:runbundled
+rem ===== 3. Start the app with the bundled runtime =====
+echo Starting Proxy App...
+echo.
+"%~dp0python.exe" proxy_app.py
+set "EC=%errorlevel%"
+goto appdone
+
 :runapp
 rem ===== 3. Start the app =====
 echo Starting Proxy App...
 echo.
 %PYCMD% proxy_app.py
 set "EC=%errorlevel%"
+
+:appdone
 echo.
 if %EC% neq 0 echo [ERROR] App exited with code %EC%. See messages above and crash.log
 pause

@@ -9,42 +9,58 @@ permissions:
 
 jobs:
   build:
-    runs-on: ubuntu-latest
+    runs-on: windows-latest
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Install zip tools
-        run: sudo apt-get update -qq && sudo apt-get install -y -qq zip unzip
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
 
-      - name: Download sing-box
-        shell: bash
+      - name: Download sing-box and wintun
+        shell: pwsh
         run: |
-          SINGBOX_TAG="v1.14.3"
-          SINGBOX_VER="1.14.3"
-          curl -fL -o sb.zip "https://github.com/SagerNet/sing-box/releases/download/${SINGBOX_TAG}/sing-box-${SINGBOX_VER}-windows-amd64.zip"
-          unzip -o sb.zip
-          mkdir -p pkg/tools
-          mv "sing-box-${SINGBOX_VER}-windows-amd64/sing-box.exe" pkg/tools/
+          $ErrorActionPreference = "Stop"
+          New-Item -ItemType Directory -Force tools | Out-Null
+          Invoke-WebRequest "https://github.com/SagerNet/sing-box/releases/download/v1.14.3/sing-box-1.14.3-windows-amd64.zip" -OutFile sb.zip -UseBasicParsing
+          Expand-Archive sb.zip -DestinationPath sb -Force
+          $exe = Get-ChildItem sb -Recurse -Filter sing-box.exe | Select-Object -First 1
+          Copy-Item $exe.FullName tools/sing-box.exe
+          Invoke-WebRequest "https://www.wintun.net/builds/wintun-0.14.1.zip" -OutFile wt.zip -UseBasicParsing
+          Expand-Archive wt.zip -DestinationPath wt -Force
+          Copy-Item wt/wintun/bin/amd64/wintun.dll tools/wintun.dll
+          Get-ChildItem tools | Select-Object Name, Length
 
-      - name: Download wintun
-        shell: bash
+      - name: Assemble portable zip
+        shell: pwsh
         run: |
-          curl -fL -o wintun.zip "https://www.wintun.net/builds/wintun-0.14.1.zip"
-          unzip -j -o wintun.zip "wintun/bin/amd64/wintun.dll" -d pkg/tools
+          $ErrorActionPreference = "Stop"
+          New-Item -ItemType Directory -Force pkg/tools | Out-Null
+          Copy-Item *.py pkg/
+          Copy-Item start.bat, install.bat, uninstall.bat, README.txt pkg/
+          Copy-Item tools/sing-box.exe, tools/wintun.dll pkg/tools/
+          Compress-Archive -Path pkg/* -DestinationPath NikkiNet-windows-x64.zip -Force
+          Get-Item NikkiNet-windows-x64.zip | Select-Object Name, Length
 
-      - name: Assemble package
-        shell: bash
+      - name: Build installer (NikkiNet-Setup.exe)
+        shell: pwsh
         run: |
-          cp *.py pkg/
-          cp start.bat install.bat uninstall.bat README.txt pkg/
-          cd pkg
-          zip -r ../NikkiNet-windows-x64.zip .
-          cd ..
-          unzip -l NikkiNet-windows-x64.zip
+          $ErrorActionPreference = "Stop"
+          if (-not (Test-Path "C:\Program Files (x86)\Inno Setup 6\ISCC.exe")) {
+            choco install innosetup -y --no-progress
+          }
+          python installer/make_icon.py
+          $m = Select-String -Path version.py -Pattern 'APP_VERSION\s*=\s*"([0-9.]+)"'
+          $ver = $m.Matches[0].Groups[1].Value
+          Write-Host "version: $ver"
+          ./installer/build_dist.ps1 -Version $ver -Compile
 
       - name: Create GitHub release
         uses: softprops/action-gh-release@v2
         with:
-          files: NikkiNet-windows-x64.zip
+          files: |
+            NikkiNet-windows-x64.zip
+            installer/Output/NikkiNet-Setup-*.exe
           generate_release_notes: true
