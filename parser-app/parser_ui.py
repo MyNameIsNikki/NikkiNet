@@ -25,7 +25,7 @@ APP_URL = "http://127.0.0.1:8000"
 HOST = "127.0.0.1"
 PORT = 8010
 URL = "http://%s:%d/" % (HOST, PORT)
-VERSION = "1.0.0"
+VERSION = "1.0.1"
 
 if hasattr(sys.stdout, "reconfigure"):
     try:
@@ -55,12 +55,26 @@ except Exception:
 # ---------------------------------------------------------------- окружение
 
 def _singbox_candidates():
-    return [
+    local = os.environ.get("LOCALAPPDATA", "")
+    prog = os.environ.get("ProgramFiles", r"C:\Program Files")
+    cands = [
         os.path.join(TOOLS_DIR, "sing-box.exe"),
+        os.environ.get("SINGBOX_PATH", ""),
         singbox.SINGBOX_EXE,
         os.path.join(os.path.dirname(BASE_DIR), "prox", "tools", "sing-box.exe"),
-        r"C:\Program Files\NikkiNet\tools\sing-box.exe",
+        os.path.join(local, "ProxyApp", "tools", "sing-box.exe"),
+        os.path.join(prog, "NikkiNet", "tools", "sing-box.exe"),
     ]
+    which = shutil.which("sing-box.exe")
+    if which:
+        cands.append(which)
+    out = []
+    seen = set()
+    for path in cands:
+        if path and path not in seen:
+            seen.add(path)
+            out.append(path)
+    return out
 
 
 def prepare_singbox():
@@ -665,7 +679,13 @@ function renderStatus(st){
   sb.textContent = st.singbox ? 'sing-box: готов' : 'sing-box: не найден';
   sb.className = 'chip ' + (st.singbox ? 'ok' : 'bad');
   if(!st.singbox){
-    document.getElementById('hint').innerHTML = 'sing-box не найден. <a href="#" onclick="downloadTools();return false">Скачать (82 МБ)</a> или снимите галочку глубокой проверки.';
+    const tools = st.tools || {};
+    if(tools.busy){
+      const last = (tools.log || []).slice(-1)[0] || '';
+      document.getElementById('hint').textContent = 'Скачиваю sing-box (около 82 МБ)... ' + last;
+    }else{
+      document.getElementById('hint').innerHTML = 'sing-box не найден. <a href="#" onclick="downloadTools();return false">Скачать (82 МБ)</a> или снимите галочку глубокой проверки.';
+    }
   }
   const app = document.getElementById('chip-app');
   app.textContent = st.app ? 'NikkiNet: запущен' : 'NikkiNet: не запущен';
@@ -765,7 +785,11 @@ def main():
     except Exception:
         pass
     print("NikkiNet Parser %s: %s" % (VERSION, URL))
-    print("sing-box: %s" % (singbox_path() or "не найден"))
+    if singbox_path():
+        print("sing-box: %s" % singbox_path())
+    else:
+        print("sing-box: не найден — запускаю автоматическую загрузку (около 82 МБ)...")
+        download_singbox()
     try:
         httpd.serve_forever()
     except KeyboardInterrupt:

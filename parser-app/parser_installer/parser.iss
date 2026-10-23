@@ -1,8 +1,8 @@
 ﻿; NikkiNet Parser installer (Inno Setup 6)
-; Build: ISCC.exe /DAppVer=1.0.0 parser.iss
+; Build: ISCC.exe /DAppVer=1.0.1 parser.iss
 
 #ifndef AppVer
-#define AppVer "1.0.0"
+#define AppVer "1.0.1"
 #endif
 
 [Setup]
