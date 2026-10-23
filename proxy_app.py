@@ -1133,6 +1133,26 @@ class AdminHandler(BaseHTTPRequestHandler):
             return res
 
         if p == "/api/server/add":
+            servers = b.get("servers")
+            if isinstance(servers, list):
+                new, errors = [], []
+                for item in servers[:5000]:
+                    if not isinstance(item, dict):
+                        errors.append("не объект")
+                        continue
+                    item = dict(item)
+                    item.pop("id", None)
+                    srv = _norm_server(item)
+                    if srv.get("host") and srv.get("port"):
+                        new.append(srv)
+                    else:
+                        errors.append(str(item.get("name") or item.get("host") or "?")[:60])
+                added_list = add_servers(state, new, source="manual")
+                if added_list and state.reloader:
+                    state.reloader.request()
+                save_state(state)
+                state.add_log("info", f"Импорт JSON: {len(added_list)} серверов")
+                return {"ok": True, "added": len(added_list), "errors": errors}
             text = b.get("text")
             errors = []
             if text:

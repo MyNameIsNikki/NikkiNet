@@ -299,8 +299,10 @@ ADMIN_HTML = """<!DOCTYPE html>
         <tbody id="srv-tbody"></tbody>
       </table></div>
       <div class="row" style="margin-top:12px">
-        <textarea id="srv-text" rows="2" style="flex:1;min-width:220px" placeholder="Вставьте ссылки или ip:port, несколько в строку..."></textarea>
+        <textarea id="srv-text" rows="2" style="flex:1;min-width:220px" placeholder="Вставьте ссылки, ip:port или JSON-массив серверов..."></textarea>
         <button class="primary" onclick="addServersText()">Импортировать</button>
+        <button onclick="document.getElementById('srv-json').click()">Загрузить JSON</button>
+        <input type="file" id="srv-json" accept=".json,application/json" class="hidden" onchange="importServersJson(this)">
       </div>
       <div class="row" style="margin-top:8px">
         <select id="n-type" style="width:120px">
@@ -703,10 +705,39 @@ async function testAll(){try{const r=await api('/api/server/testall','POST',{});
 async function purgeDead(){try{const r=await api('/api/server/purge','POST',{});toast('Удалено нерабочих: '+(r.removed??0));refresh();}catch(e){toast(e.message);}}
 async function geoRefresh(){try{await api('/api/geo/refresh','POST',{});toast('Определяю страны...');}catch(e){toast(e.message);}}
 async function addWarp(){try{toast('Регистрирую WARP (может занять ~30с)...');const r=await api('/api/warp/add','POST',{});const res=r.result||{};if(r.error){toast('WARP: '+r.error);}else if(res.ok){toast('WARP работает: '+res.latency_ms+' мс');}else{toast('WARP зарегистрирован, но недоступен: '+(res.error||''));}refresh();}catch(e){toast(e.message);}}
+function parseServersJson(text){
+  let data=JSON.parse(text);
+  if(!Array.isArray(data))data=Array.isArray(data.servers)?data.servers:[data];
+  return data.filter(x=>x&&typeof x==='object'&&!Array.isArray(x));
+}
+async function importServersJson(input){
+  const file=input.files&&input.files[0];
+  if(!file)return;
+  try{
+    const servers=parseServersJson(await file.text());
+    if(!servers.length){toast('В JSON не найдено серверов');return;}
+    const r=await api('/api/server/add','POST',{servers});
+    toast('Из JSON добавлено: '+r.added+(r.errors&&r.errors.length?(' · пропущено: '+r.errors.length):''));
+    refresh();
+  }catch(e){toast('Ошибка JSON: '+e.message);}
+  finally{input.value='';}
+}
 async function addServersText(){
   const text=document.getElementById('srv-text').value.trim();
   if(!text)return;
-  try{const r=await api('/api/server/add','POST',{text});document.getElementById('srv-text').value='';toast('Добавлено серверов: '+r.added+(r.errors?(' Ошибки: '+r.errors.join('; ').slice(0,300)):''));refresh();}catch(e){toast(e.message);}
+  try{
+    let r;
+    if(text[0]==='{'||text[0]==='['){
+      const servers=parseServersJson(text);
+      if(!servers.length){toast('В JSON не найдено серверов');return;}
+      r=await api('/api/server/add','POST',{servers});
+    }else{
+      r=await api('/api/server/add','POST',{text});
+    }
+    document.getElementById('srv-text').value='';
+    toast('Добавлено серверов: '+r.added+(r.errors&&r.errors.length?(' · пропущено: '+r.errors.length):''));
+    refresh();
+  }catch(e){toast(e.message);}
 }
 async function addServerManual(){
   const body={server:{type:document.getElementById('n-type').value,host:document.getElementById('n-host').value.trim(),port:+document.getElementById('n-port').value,name:document.getElementById('n-name').value.trim()}};

@@ -5,7 +5,7 @@ APP_VERSION сравнивается с тегом последнего рели
 (без начальной буквы "v"). Если тег больше — панель предлагает обновление.
 """
 
-APP_VERSION = "1.3.2"
+APP_VERSION = "1.3.3"
 
 # Откуда берутся релизы (страница: https://github.com/MyNameIsNikki/NikkiNet)
 GITHUB_REPO = "MyNameIsNikki/NikkiNet"
