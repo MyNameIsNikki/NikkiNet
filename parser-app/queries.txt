@@ -1,0 +1,16 @@
+# Поисковые запросы для режима --internet
+# Строки, начинающиеся с #, игнорируются.
+free vless subscription link 2026
+free vmess configs list
+free trojan proxy list
+free shadowsocks servers list
+free hysteria2 configs
+free socks5 proxy list txt
+free http proxy list txt
+"vless://" pastebin
+site:pastebin.com "vless://"
+site:pastebin.com "vmess://"
+site:t.me vless configs
+site:t.me vmess configs
+free v2ray configs daily
+free proxy list txt

@@ -150,6 +150,8 @@ python installer/make_icon.py
 | `appupdate.py` | проверка релизов и самообновление |
 | `netparse.py` | встроенный автосбор серверов (списки + публичные сайты) |
 | `webscan.py` | сканер страниц: ссылки, конфиги, таблицы, base64 |
+| `parser-app/` | отдельное приложение-парсер с UI и своим установщиком |
+
 | `export_android.py` | экспорт серверов и подписок для Android (v2rayNG/SFA) |
 | `install.bat` / `start.bat` / `uninstall.bat` | установка / запуск / удаление |
 | `installer/nikkinet.iss` | скрипт установщика (Inno Setup) |

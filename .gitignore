@@ -25,3 +25,10 @@ installer/preview.png
 # Экспорт серверов для Android (содержит ваши ссылки/подписки)
 android/
 config.json.bak-*
+
+# Отдельное приложение-парсер: результаты и сборки содержат серверы
+parser-app/result/
+parser-app/parser_ui.lock
+parser-app/parser_installer/.build/
+parser-app/parser_installer/Output/
+

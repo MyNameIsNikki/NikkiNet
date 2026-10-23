@@ -1,0 +1,22 @@
+# Стартовые сайты для обхода в режиме --internet
+# Обход идёт только по страницам того же сайта (по ссылкам).
+# Сайты с бесплатными конфигами (проверены 23.10.2026):
+https://v2cross.com/free-v2ray-nodes/
+https://v2cross.com/1884.html
+https://v2rayse.com/free-node
+https://clashnode.com/free-node/
+https://freeclashnode.com/free-node/
+https://nodefree.org/
+https://v2rayng.com/
+https://v2ray.download/
+https://www.v2ray.cool/
+https://v2rayshare.net/
+# Списки открытых HTTP/SOCKS-прокси:
+https://free-proxy-list.net/
+https://www.sslproxies.org/
+https://www.us-proxy.org/
+https://www.socks-proxy.net/
+https://www.my-proxy.com/free-proxy-list.html
+https://proxyspace.pro/
+https://spys.me/
+https://www.proxydb.net/
