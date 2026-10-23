@@ -3,7 +3,7 @@ ADMIN_HTML = """<!DOCTYPE html>
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Nekoray-style Proxy Manager</title>
+<title>NikkiNet</title>
 <style>
   :root{
     color-scheme:dark;
@@ -228,7 +228,7 @@ ADMIN_HTML = """<!DOCTYPE html>
           <button onclick="genLanPass()">Новый пароль</button>
           <button class="primary" onclick="saveLanCreds()">Применить</button>
         </div>
-        <div class="muted" style="margin-top:8px">На телефоне или другом ПК в той же Wi-Fi сети укажите этот адрес как HTTP-прокси и введите логин с паролем. Порт открыт только для локальной подсети и только пока режим включён. Веб-панель по-прежнему доступна только с этого компьютера.</div>
+        <div class="muted" style="margin-top:8px">На телефоне или другом ПК в той же Wi-Fi сети укажите этот адрес как HTTP-прокси и введите логин с паролем. Порт открыт только для локальной подсети и только пока режим включён. Интерфейс приложения по-прежнему доступен только с этого компьютера.</div>
       </div>
     </div>
 
@@ -385,7 +385,7 @@ async function refresh(){
   document.getElementById('core-status').innerHTML=state.core.running
     ?'<span class="dot ok-dot"></span><span class="ok">движок работает</span>'
     :'<span class="dot err-dot"></span><span class="err">'+(state.core.error?('движок: '+esc(state.core.error.slice(0,40))):'движок: не запущен')+'</span>';
-  document.getElementById('listener-note').textContent='Локальный прокси: '+((state.lan&&state.lan.enabled)?((state.lan_ip||'?')+':'+(state.lan_port||8889)+', с логином и паролем)'):'127.0.0.1:8888')+' · Веб-панель: '+state.admin+' · Режим неопознанного трафика: '+state.unmatched;
+  document.getElementById('listener-note').textContent='Локальный прокси: '+((state.lan&&state.lan.enabled)?((state.lan_ip||'?')+':'+(state.lan_port||8889)+', с логином и паролем)'):'127.0.0.1:8888')+' · Интерфейс: '+state.admin+' · Режим неопознанного трафика: '+state.unmatched;
   document.querySelectorAll('#mode-seg button').forEach(b=>b.classList.toggle('on',b.dataset.m===state.unmatched));
   document.querySelectorAll('#sel-seg button').forEach(b=>b.classList.toggle('on',b.dataset.s===state.selection_mode));
   document.getElementById('sp-toggle').checked=!!state.system_proxy;

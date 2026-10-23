@@ -1598,6 +1598,49 @@ def _bump_conn_total(state):
     return state.conn_total
 
 
+def open_app_window(url):
+    """Открывает панель как отдельное окно приложения (Edge/Chrome --app)."""
+    env = os.environ
+    pf = env.get("ProgramFiles", r"C:\Program Files")
+    pf86 = env.get("ProgramFiles(x86)", r"C:\Program Files (x86)")
+    local = env.get("LOCALAPPDATA", "")
+    candidates = [
+        os.path.join(pf86, "Microsoft", "Edge", "Application", "msedge.exe"),
+        os.path.join(pf, "Microsoft", "Edge", "Application", "msedge.exe"),
+        os.path.join(local, "Microsoft", "Edge", "Application", "msedge.exe"),
+        os.path.join(pf, "Google", "Chrome", "Application", "chrome.exe"),
+        os.path.join(pf86, "Google", "Chrome", "Application", "chrome.exe"),
+        os.path.join(local, "Google", "Chrome", "Application", "chrome.exe"),
+    ]
+    exe = ""
+    for path in candidates:
+        if path and os.path.isfile(path):
+            exe = path
+            break
+    if exe:
+        try:
+            subprocess.Popen(
+                [exe, "--app=" + url, "--window-size=1280,900"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                creationflags=CREATE_NO_WINDOW,
+            )
+            return True
+        except Exception:
+            pass
+    try:
+        ctypes.windll.user32.MessageBoxW(
+            0,
+            "Не найден Microsoft Edge или Google Chrome.\n"
+            "Установите Edge или Chrome — без них окно приложения не открыть.",
+            "NikkiNet",
+            0x10,
+        )
+    except Exception:
+        pass
+    return False
+
+
 def run():
     state = load_state()
     want_vpn = "--vpn" in sys.argv
@@ -1697,14 +1740,10 @@ def run():
     print(f"  Локальный прокси: http://{LISTEN_HOST}:{LISTEN_PORT}  (http/socks mixed)")
     if _lan["enabled"]:
         print(f"  Для локальной сети: {lan_ip()}:{core_mod.LAN_PORT}  (логин {_lan['username']}, пароль задан)")
-    print(f"  Веб-панель:       http://{ADMIN_HOST}:{ADMIN_PORT}")
+    print(f"  Панель управления: http://{ADMIN_HOST}:{ADMIN_PORT}")
     print("  Настройте браузер на прокси 127.0.0.1:8888")
     print("=" * 60)
-    try:
-        import webbrowser
-        threading.Timer(1.0, lambda: webbrowser.open(f"http://{ADMIN_HOST}:{ADMIN_PORT}")).start()
-    except Exception:
-        pass
+    threading.Timer(1.0, lambda: open_app_window(f"http://{ADMIN_HOST}:{ADMIN_PORT}/")).start()
 
     try:
         while not _restart_event.is_set():
