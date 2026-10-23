@@ -119,8 +119,8 @@ python export_android.py
 Релиз собирается и публикуется автоматически при пуше git-тега:
 
 ```bash
-git tag v1.3.0
-git push origin v1.3.0
+git tag v1.3.1
+git push origin v1.3.1
 ```
 
 GitHub Actions скачает sing-box и wintun, соберёт `NikkiNet-windows-x64.zip`
@@ -133,8 +133,8 @@ GitHub Actions скачает sing-box и wintun, соберёт `NikkiNet-windo
 
 ```powershell
 python installer/make_icon.py
-./installer/build_dist.ps1 -Version 1.3.0 -Compile
-# результат: installer/Output/NikkiNet-Setup-1.3.0.exe
+./installer/build_dist.ps1 -Version 1.3.1 -Compile
+# результат: installer/Output/NikkiNet-Setup-1.3.1.exe
 ```
 
 ## Состав

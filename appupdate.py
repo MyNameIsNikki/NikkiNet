@@ -29,6 +29,7 @@ import zipfile
 import version
 
 API_LATEST = "https://api.github.com/repos/%s/releases/latest" % version.GITHUB_REPO
+API_RELEASES = "https://api.github.com/repos/%s/releases?per_page=30" % version.GITHUB_REPO
 CHECK_INTERVAL = 6 * 3600  # проверять каждые 6 часов
 TIMEOUT = 15
 STAGE_DIR = ".update"
@@ -45,27 +46,44 @@ def _headers():
 
 
 def check_latest():
-    """Запросить последний релиз из GitHub. dict с данными или None при ошибке."""
+    """Найти самый свежий релиз с zip-архивом приложения.
+
+    /releases/latest возвращает последний релиз репозитория, а в нём может
+    не быть zip (например, релиз отдельного приложения-парсера). Поэтому
+    просматриваем список релизов и берём первый непустой zip.
+    """
     global _latest, _last_error, _last_check_ts
     try:
-        req = urllib.request.Request(API_LATEST, headers=_headers())
+        req = urllib.request.Request(API_RELEASES, headers=_headers())
         with urllib.request.urlopen(req, timeout=TIMEOUT) as resp:
             data = json.loads(resp.read().decode("utf-8"))
-        tag = str(data.get("tag_name") or "").strip().lstrip("vV")
+        releases = data if isinstance(data, list) else []
+        tag = ""
         zip_asset = None
-        for a in data.get("assets") or []:
-            if str(a.get("name") or "").lower().endswith(".zip"):
-                zip_asset = a
+        chosen = None
+        for rel in releases:
+            if not isinstance(rel, dict) or rel.get("draft") or rel.get("prerelease"):
+                continue
+            rel_tag = str(rel.get("tag_name") or "").strip().lstrip("vV")
+            rel_zip = None
+            for a in rel.get("assets") or []:
+                if str(a.get("name") or "").lower().endswith(".zip"):
+                    rel_zip = a
+                    break
+            if rel_tag and rel_zip and rel_zip.get("browser_download_url"):
+                tag = rel_tag
+                zip_asset = rel_zip
+                chosen = rel
                 break
         if not tag or not zip_asset:
-            _last_error = "в последнем релизе нет zip-файла"
+            _last_error = "не найден релиз с zip-файлом"
             return None
         info = {
             "version": tag,
             "zip_url": zip_asset.get("browser_download_url") or "",
             "zip_size": zip_asset.get("size") or 0,
-            "notes": str(data.get("body") or "")[:4000],
-            "url": data.get("html_url") or "",
+            "notes": str(chosen.get("body") or "")[:4000],
+            "url": chosen.get("html_url") or "",
             "checked_ts": int(time.time()),
         }
         if not info["zip_url"]:
