@@ -61,8 +61,10 @@ exit /b 1
 
 :runbundled
 rem ===== 3. Start the app with the bundled runtime =====
-echo Starting Proxy App...
-echo.
+if exist "%~dp0pythonw.exe" (
+  start "" "%~dp0pythonw.exe" proxy_app.py
+  exit /b 0
+)
 "%~dp0python.exe" proxy_app.py
 set "EC=%errorlevel%"
 goto appdone
