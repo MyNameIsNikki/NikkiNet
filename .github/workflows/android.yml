@@ -69,7 +69,8 @@ jobs:
         env:
           KEYSTORE_PASS: nikkinet-mobile-2026
         run: |
-          keytool -genkeypair -v \
+          rm -f release.keystore
+          keytool -genkeypair -v -noprompt \
             -keystore release.keystore \
             -alias nikkinet \
             -keyalg RSA -keysize 2048 -validity 10000 \
