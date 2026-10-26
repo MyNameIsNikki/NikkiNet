@@ -27,8 +27,16 @@ jobs:
           go-version: "1.26.10"
           cache: false
 
-      - name: Set up Android SDK
-        uses: android-actions/setup-android@v3
+      - name: Configure Android SDK
+        run: |
+          SDK="${ANDROID_SDK_ROOT:-/usr/local/lib/android/sdk}"
+          if [ ! -d "$SDK" ]; then SDK="$ANDROID_HOME"; fi
+          echo "ANDROID_SDK_ROOT=$SDK" >> "$GITHUB_ENV"
+          echo "ANDROID_HOME=$SDK" >> "$GITHUB_ENV"
+          SDKMANAGER=$(find "$SDK/cmdline-tools" -name sdkmanager -type f | sort | tail -1)
+          echo "using $SDKMANAGER"
+          echo "SDKMANAGER=$SDKMANAGER" >> "$GITHUB_ENV"
+          echo "$(dirname "$SDKMANAGER")" >> "$GITHUB_PATH"
 
       - name: Install Android platform, build tools and NDK
         run: |
@@ -81,8 +89,14 @@ jobs:
         run: |
           mkdir -p out
           find sfa/clients/android/app/build/outputs/apk/other/release -name '*.apk' -print
-          cp sfa/clients/android/app/build/outputs/apk/other/release/*.apk \
-             out/NikkiNet-Mobile-1.0.0.apk
+          apk=$(find sfa/clients/android/app/build/outputs/apk/other/release -name '*universal*.apk' | head -1)
+          if [ -z "$apk" ]; then
+            apk=$(find sfa/clients/android/app/build/outputs/apk/other/release -name '*arm64-v8a*.apk' | head -1)
+          fi
+          if [ -z "$apk" ]; then
+            apk=$(find sfa/clients/android/app/build/outputs/apk/other/release -name '*.apk' | head -1)
+          fi
+          cp "$apk" out/NikkiNet-Mobile-1.0.0.apk
           ls -lh out
 
       - name: Upload APK artifact
