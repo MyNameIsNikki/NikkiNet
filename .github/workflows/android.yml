@@ -1,0 +1,105 @@
+name: Build Android APK
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+
+    steps:
+      - name: Checkout NikkiNet
+        uses: actions/checkout@v4
+
+      - name: Set up Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.26.10"
+          cache: false
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install Android platform, build tools and NDK
+        run: |
+          yes | sdkmanager --licenses >/dev/null 2>&1 || true
+          sdkmanager "platforms;android-37" "build-tools;37.0.0" "ndk;28.0.13004108"
+          echo "ANDROID_NDK_HOME=$ANDROID_SDK_ROOT/ndk/28.0.13004108" >> "$GITHUB_ENV"
+
+      - name: Clone sing-box and the Android client
+        run: |
+          git clone --depth 1 --branch v1.14.4 https://github.com/SagerNet/sing-box.git sfa
+          cd sfa
+          git submodule update --init --recursive
+
+      - name: Build libbox.aar
+        working-directory: sfa
+        run: |
+          export PATH="$(go env GOPATH)/bin:$PATH"
+          export ANDROID_NDK_HOME="$ANDROID_SDK_ROOT/ndk/28.0.13004108"
+          make lib_install
+          make lib_android
+          ls -lh libbox.aar
+          mkdir -p clients/android/app/libs
+          mv libbox.aar clients/android/app/libs/
+
+      - name: Rebrand as NikkiNet
+        run: python3 mobile/brand.py sfa/clients/android
+
+      - name: Configure signing
+        working-directory: sfa/clients/android/app
+        env:
+          KEYSTORE_PASS: nikkinet-mobile-2026
+        run: |
+          keytool -genkeypair -v \
+            -keystore release.keystore \
+            -alias nikkinet \
+            -keyalg RSA -keysize 2048 -validity 10000 \
+            -storepass "$KEYSTORE_PASS" -keypass "$KEYSTORE_PASS" \
+            -dname "CN=NikkiNet, OU=Mobile, O=NikkiNet, C=RU"
+          printf 'KEYSTORE_PASS=%s\nALIAS_NAME=nikkinet\nALIAS_PASS=%s\n' \
+            "$KEYSTORE_PASS" "$KEYSTORE_PASS" > /tmp/nn.properties
+          echo "LOCAL_PROPERTIES=$(base64 -w0 /tmp/nn.properties)" >> "$GITHUB_ENV"
+
+      - name: Build release APK
+        working-directory: sfa/clients/android
+        run: |
+          chmod +x gradlew
+          ./gradlew --no-daemon :app:assembleOtherRelease
+
+      - name: Collect APK
+        run: |
+          mkdir -p out
+          find sfa/clients/android/app/build/outputs/apk/other/release -name '*.apk' -print
+          cp sfa/clients/android/app/build/outputs/apk/other/release/*.apk \
+             out/NikkiNet-Mobile-1.0.0.apk
+          ls -lh out
+
+      - name: Upload APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: NikkiNet-Mobile-APK
+          path: out/NikkiNet-Mobile-1.0.0.apk
+
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: mobile-v1.0.0
+          name: NikkiNet Mobile 1.0.0
+          body: |
+            NikkiNet Mobile — Android VPN-клиент на базе sing-box.
+
+            Установка: скачайте APK, разрешите установку из неизвестных источников,
+            добавьте свои серверы или подписку в приложении.
+          files: out/NikkiNet-Mobile-1.0.0.apk
+          generate_release_notes: false
