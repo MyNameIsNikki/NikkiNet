@@ -256,6 +256,8 @@ ADMIN_HTML = """<!DOCTYPE html>
         </div>
         <label class="switch"><input type="checkbox" id="sp-toggle" onchange="setSystemProxy(this.checked)"> Системный прокси</label>
         <label class="switch"><input type="checkbox" id="vpn-toggle" onchange="setVpn(this.checked)"> Полный VPN (TUN)</label>
+        <label class="switch"><input type="checkbox" id="ai-toggle" onchange="setAi(this.checked)"> AI-режим (ИИ через прокси)</label>
+        <span class="tag" id="ai-state">выключен</span>
       </div>
       <div class="muted" id="listener-note" style="margin-top:8px"></div>
     </div>
@@ -438,6 +440,8 @@ async function refresh(){
   document.querySelectorAll('#sel-seg button').forEach(b=>b.classList.toggle('on',b.dataset.s===state.selection_mode));
   document.getElementById('sp-toggle').checked=!!state.system_proxy;
   document.getElementById('vpn-toggle').checked=!!state.vpn;
+  document.getElementById('ai-toggle').checked=!!state.ai_mode;
+  renderAi();
   renderLan();
   renderServers(); renderQC(); renderSubs(); renderRules();
   }catch(e){toast('refresh: '+e.message);}
@@ -540,6 +544,14 @@ async function setMode(m){try{await api('/api/mode','POST',{unmatched:m});refres
 async function setSelMode(m){try{await api('/api/mode','POST',{selection_mode:m});refresh();}catch(e){toast(e.message);}}
 async function setSystemProxy(v){try{await api('/api/system-proxy','POST',{enabled:v});refresh();}catch(e){document.getElementById('sp-toggle').checked=!v;toast(e.message);}}
 async function setVpn(v){try{const r=await api('/api/vpn','POST',{enabled:v});if(r.relaunching){toast(r.message||'Перезапуск...');return;}refresh();}catch(e){document.getElementById('vpn-toggle').checked=!v;toast(e.message);}}
+async function setAi(v){try{const r=await api('/api/ai','POST',{enabled:v});if(r.warning)toast(r.warning);refresh();}catch(e){document.getElementById('ai-toggle').checked=!v;toast(e.message);}}
+function renderAi(){
+  const t=document.getElementById('ai-state');
+  if(!t)return;
+  const on=!!state.ai_mode;
+  t.textContent=on?('включён · '+(state.ai_domains||0)+' доменов'):'выключен';
+  t.className='tag'+(on?' ok':'');
+}
 function renderLan(){
   const l=state.lan||{};
   document.getElementById('lan-toggle').checked=!!l.enabled;

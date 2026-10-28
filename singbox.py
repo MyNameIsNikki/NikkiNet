@@ -38,6 +38,59 @@ TAG_BLOCK = "block"
 TAG_MAIN = "MAIN"
 TAG_AUTO = "AUTO"
 TAG_DNS = "dns"
+TAG_DNS_AI = "dns-ai"
+
+# Домены ИИ-сервисов, которые в РФ часто недоступны.
+# Маршрутизируем их через выбранный прокси и резолвим DNS через него же.
+AI_DOMAINS = [
+    "openai.com",
+    "chatgpt.com",
+    "oaistatic.com",
+    "oaiusercontent.com",
+    "openai.azure.com",
+    "anthropic.com",
+    "claude.ai",
+    "gemini.google.com",
+    "generativeai.google",
+    "ai.google.dev",
+    "bard.google.com",
+    "makersuite.google.com",
+    "perplexity.ai",
+    "copilot.microsoft.com",
+    "copilot.cloud.microsoft",
+    "githubcopilot.com",
+    "midjourney.com",
+    "stability.ai",
+    "poe.com",
+    "character.ai",
+    "huggingface.co",
+    "x.ai",
+    "grok.com",
+    "deepseek.com",
+    "mistral.ai",
+    "groq.com",
+    "together.ai",
+    "together.xyz",
+    "cohere.ai",
+    "cohere.com",
+    "runwayml.com",
+    "elevenlabs.io",
+    "suno.com",
+    "suno.ai",
+    "udio.com",
+    "meta.ai",
+    "lmarena.ai",
+    "openrouter.ai",
+    "replicate.com",
+    "fal.ai",
+    "ideogram.ai",
+    "leonardo.ai",
+    "civitai.com",
+    "janitorai.com",
+    "chub.ai",
+    "jasper.ai",
+    "writesonic.com",
+]
 
 MAX_LOG_SIZE = 64 * 1024 * 1024
 
@@ -324,7 +377,7 @@ def proxy_group_tag(selection_mode):
     return TAG_AUTO if selection_mode == "auto" else TAG_MAIN
 
 
-def build_config(servers, active_id, rules, unmatched, vpn, proxy_port, selection_mode="manual", lan=None):
+def build_config(servers, active_id, rules, unmatched, vpn, proxy_port, selection_mode="manual", lan=None, ai_mode=False):
     outbounds = [
         {"type": "direct", "tag": TAG_DIRECT},
         {"type": "block", "tag": TAG_BLOCK},
@@ -423,8 +476,17 @@ def build_config(servers, active_id, rules, unmatched, vpn, proxy_port, selectio
             continue
         route_rules.append({"action": "route", "outbound": target, **matcher(r)})
 
+    # AI-режим: после пользовательских правил, чтобы ручные правила имели приоритет
+    if ai_mode:
+        route_rules.append({
+            "action": "route",
+            "outbound": proxy_out,
+            "domain_suffix": list(AI_DOMAINS),
+        })
+
     final = {"proxy": proxy_out, "direct": TAG_DIRECT, "block": TAG_BLOCK}.get(unmatched, TAG_DIRECT)
 
+    dns_rules = []
     if vpn:
         dns_detour = proxy_out if unmatched == "proxy" else None
         doh = _clean({
@@ -440,9 +502,23 @@ def build_config(servers, active_id, rules, unmatched, vpn, proxy_port, selectio
     else:
         dns_servers = [{"type": "local", "tag": TAG_DNS}]
 
+    if ai_mode:
+        # DNS для ИИ-доменов идёт через тот же прокси (DoH), без утечки к local resolver
+        dns_servers.append(_clean({
+            "type": "https",
+            "tag": TAG_DNS_AI,
+            "server": "1.1.1.1",
+            "detour": proxy_out,
+        }))
+        dns_rules.append({"domain_suffix": list(AI_DOMAINS), "server": TAG_DNS_AI})
+
+    dns_cfg = {"servers": dns_servers, "final": TAG_DNS, "strategy": "ipv4_only"}
+    if dns_rules:
+        dns_cfg["rules"] = dns_rules
+
     config = {
         "log": {"level": "info", "timestamp": True},
-        "dns": {"servers": dns_servers, "final": TAG_DNS, "strategy": "ipv4_only"},
+        "dns": dns_cfg,
         "inbounds": inbounds,
         "outbounds": outbounds,
         "route": {"rules": route_rules, "final": final, "default_domain_resolver": TAG_DNS},

@@ -120,6 +120,7 @@ class State:
     selection_mode: str = "manual"
     system_proxy: bool = False
     vpn: bool = False
+    ai_mode: bool = False
     lan: dict = None
     connected_since: float = 0.0
     orig_proxy: dict = None
@@ -172,6 +173,7 @@ def load_state():
                 st.selection_mode = "manual"
             st.system_proxy = data.get("system_proxy", False)
             st.vpn = data.get("vpn", False)
+            st.ai_mode = bool(data.get("ai_mode", False))
             st.connected_since = float(data.get("connected_since") or 0.0)
             st.orig_proxy = data.get("orig_proxy")
             st.warp_reg = data.get("warp_reg")
@@ -197,6 +199,7 @@ def save_state(state):
             "selection_mode": state.selection_mode,
             "system_proxy": state.system_proxy,
             "vpn": state.vpn,
+            "ai_mode": bool(state.ai_mode),
             "connected_since": state.connected_since,
             "orig_proxy": state.orig_proxy,
             "warp_reg": state.warp_reg,
@@ -399,7 +402,7 @@ def _ps_elevated(ps, tag):
 def do_reload(state, force=False):
     cfg = core_mod.build_config(
         state.servers, state.active_server_id, state.rules, state.unmatched, state.vpn, LISTEN_PORT,
-        state.selection_mode, lan=state.lan
+        state.selection_mode, lan=state.lan, ai_mode=state.ai_mode
     )
     return state.core.start(cfg, LISTEN_PORT, force=force)
 
@@ -442,7 +445,7 @@ class Reloader:
         for _attempt in range(4):
             cfg = core_mod.build_config(
                 st.servers, st.active_server_id, st.rules, st.unmatched, st.vpn, LISTEN_PORT,
-                st.selection_mode, lan=st.lan
+                st.selection_mode, lan=st.lan, ai_mode=st.ai_mode
             )
             running = bool(st.core.running and st.core.proc and st.core.proc.poll() is None)
             if not force and running and st.core.cfg_hash == core_mod.config_hash(cfg):
@@ -1071,6 +1074,8 @@ class AdminHandler(BaseHTTPRequestHandler):
             "group_mode": core_mod.proxy_group_tag(state.selection_mode),
             "system_proxy": state.system_proxy,
             "vpn": state.vpn,
+            "ai_mode": bool(state.ai_mode),
+            "ai_domains": len(core_mod.AI_DOMAINS),
             "lan": _norm_lan(state.lan),
             "lan_ip": lan_ip(),
             "lan_port": core_mod.LAN_PORT,
@@ -1535,6 +1540,24 @@ class AdminHandler(BaseHTTPRequestHandler):
             res = {"ok": True, "lan": new, "address": f"{lan_ip()}:{core_mod.LAN_PORT}"}
             if want and not fw_ok:
                 res["warning"] = ("Доступ включён, но порт не открыт в брандмауэре: " + fw_err[:160])
+            return res
+
+        if p == "/api/ai":
+            want = bool(b.get("enabled"))
+            prev = state.ai_mode
+            state.ai_mode = want
+            ok, msg = do_reload(state, force=True)
+            if not ok:
+                state.ai_mode = prev
+                do_reload(state, force=True)
+                save_state(state)
+                state.add_log("error", f"AI-режим: {msg[:150]}")
+                return {"ok": False, "error": msg[:250]}
+            save_state(state)
+            state.add_log("info", "AI-режим " + ("включён" if want else "выключен"))
+            res = {"ok": True, "ai_mode": want, "domains": len(core_mod.AI_DOMAINS)}
+            if want and not state.servers:
+                res["warning"] = "Нет серверов: AI-трафик пойдёт напрямую"
             return res
 
         if p == "/api/reload":
