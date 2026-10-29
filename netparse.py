@@ -6,6 +6,8 @@
 затем отдаёт готовые серверы приложению через callback.
 """
 import ipaddress
+import json
+import os
 import random
 import re
 import socket
@@ -18,9 +20,13 @@ import webscan
 
 # ---------------------------------------------------------------- настройки
 
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+STATS_FILE = os.path.join(BASE_DIR, "autoparse-stats.json")
+
 SHARE_TYPES = {"vless", "vmess", "trojan", "ss", "hysteria2", "tuic"}
 HTTP_TYPES = {"http", "https"}
 SOCKS_TYPES = {"socks"}
+
 
 DEFAULT_PER_SOURCE = 250
 DEFAULT_MAX_TOTAL = 1200
@@ -96,9 +102,14 @@ QUERIES = [
     "free trojan proxy list",
     "free shadowsocks servers",
     "free hysteria2 nodes",
+    "free vless reality config",
+    "free v2ray subscription base64",
+    "free clash vless nodes",
     "free socks5 proxy list",
     "free proxy list txt",
+    "бесплатные vless конфиги",
 ]
+
 
 _HOST_RE = re.compile(r"^[a-z0-9]([a-z0-9\.\-]{0,251}[a-z0-9])?$", re.I)
 
@@ -113,10 +124,15 @@ _STATE = {
     "alive": 0,
     "working": 0,
     "added": 0,
+    "search_links": 0,
+    "pages": 0,
+    "dropped": 0,
+    "tls_ok": 0,
     "started": 0.0,
     "finished": 0.0,
     "log": [],
 }
+
 
 
 def status():
@@ -229,6 +245,78 @@ def _variant_key(s):
     return "|".join(str(p or "") for p in parts)
 
 
+def _source_name(s):
+    src = str(s.get("source") or "")
+    if src.startswith("autoparse:"):
+        src = src[len("autoparse:"):]
+    return src or "unknown"
+
+
+def _load_stats():
+    try:
+        with open(STATS_FILE, "r", encoding="utf-8") as fh:
+            data = json.load(fh)
+        sources = data.get("sources")
+        if isinstance(sources, dict):
+            return {str(k): v for k, v in sources.items() if isinstance(v, dict)}
+    except Exception:
+        pass
+    return {}
+
+
+def _save_stats(stats):
+    if not stats:
+        return
+    tmp = STATS_FILE + ".tmp"
+    try:
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump({"updated": int(time.time()), "sources": stats},
+                      fh, ensure_ascii=False, indent=1)
+        os.replace(tmp, STATS_FILE)
+    except Exception as exc:
+        _log("не удалось сохранить статистику источников: %s" % str(exc)[:120])
+
+
+def _source_score(name, stats):
+    """Оценка источника: доля рабочих/живых с сглаживанием."""
+    rec = stats.get(name) or {}
+    try:
+        cands = int(rec.get("candidates") or 0)
+        alive = int(rec.get("alive") or 0)
+        working = int(rec.get("working") or 0)
+    except (TypeError, ValueError):
+        return 0.05
+    base = cands + 8.0
+    return (working + 0.4) / base + 0.12 * (alive + 1) / base
+
+
+def _update_stats(cands, alive, working):
+    """Накапливает урожайность источников между запусками."""
+    stats = _load_stats()
+    now = int(time.time())
+    touched = set()
+    for group, field in ((cands, "candidates"), (alive, "alive"), (working, "working")):
+        for s in group:
+            name = _source_name(s)
+            rec = stats.setdefault(name, {})
+            rec[field] = int(rec.get(field) or 0) + 1
+            rec["last_ts"] = now
+            touched.add(name)
+    for name in touched:
+        rec = stats.get(name) or {}
+        rec["runs"] = int(rec.get("runs") or 0) + 1
+    _save_stats(stats)
+    ranked = sorted(
+        ((name, rec) for name, rec in stats.items() if rec.get("candidates")),
+        key=lambda kv: (int(kv[1].get("working") or 0), int(kv[1].get("alive") or 0)),
+        reverse=True)[:5]
+    if ranked:
+        _log("лучшие источники: " + ", ".join(
+            "%s (%s/%s)" % (name, rec.get("working") or 0, rec.get("candidates") or 0)
+            for name, rec in ranked))
+
+
+
 def _ready(s):
     """Проверяет обязательные поля: неполный конфиг всё равно не подключится."""
     typ = s.get("type")
@@ -275,7 +363,8 @@ def _deep_one(s):
         res = singbox.test_outbound(s, timeout=DEFAULT_DEEP_TIMEOUT, tls_check=True)
     except Exception as exc:
         return False, str(exc)[:80]
-    ok = bool(res.get("ok")) and (res.get("latency_ms") or 10 ** 9) <= DEFAULT_CUTOFF_MS
+    ok = (bool(res.get("ok")) and bool(res.get("tls_ok"))
+          and (res.get("latency_ms") or 10 ** 9) <= DEFAULT_CUTOFF_MS)
     s["latency"] = int(res["latency_ms"]) if ok else None
     s["latency_ok"] = ok
     s["tested"] = True
@@ -334,13 +423,15 @@ def _collect_web(opts):
     depth = int(opts.get("depth") or DEFAULT_DEPTH)
     seeds = list(SEEDS)
     if opts.get("use_search", True):
-        queries = list(QUERIES)[:4]
+        queries = list(QUERIES)[:6]
         found, search_error = webscan.search_many(
-            queries, limit=6, timeout=10.0, log=_log)
+            queries, limit=5, timeout=9.0, log=_log)
         if search_error:
             _log("поиск: %s" % search_error[:160])
         if found:
-            seeds = found + seeds
+            # результаты поиска идут первыми, но база SEEDS не вытесняется
+            seeds = found[:12] + seeds + found[12:]
+        _set(search_links=len(found))
         _log("поиск: ссылок %d, к обходу %d" % (len(found), len(seeds)))
     raw, page_stats = webscan.crawl(
         seeds, max_pages=pages, max_depth=depth,
@@ -351,30 +442,67 @@ def _collect_web(opts):
         if s:
             out.append(s)
     ok_pages = sum(1 for p in page_stats if p.get("servers"))
+    _set(pages=len(page_stats))
     _log("обход сайтов: страниц %d, с серверами %d, найдено %d"
          % (len(page_stats), ok_pages, len(out)))
     return out
 
 
-def _pick_deep_sample(alive, limit):
-    """Стратифицированная выборка: большинство слотов — share-конфигам."""
+
+_DEEP_TYPE_WEIGHT = {
+    "vless": 1.6, "trojan": 1.5, "hysteria2": 1.35, "vmess": 1.25,
+    "tuic": 1.15, "ss": 1.0, "http": 0.7, "https": 0.7, "socks": 0.8,
+}
+
+
+def _weighted_pick(items, count, stats):
+    """Выбор без возврата с приоритетом типа и истории источника."""
+    pool = list(items)
+    out = []
+    count = max(0, min(int(count), len(pool)))
+    while len(out) < count and pool:
+        weights = []
+        for s in pool:
+            weight = _DEEP_TYPE_WEIGHT.get(s.get("type"), 1.0)
+            weight *= 1.0 + 8.0 * _source_score(_source_name(s), stats)
+            weights.append(max(0.01, weight))
+        total = sum(weights)
+        point = random.random() * total
+        chosen = len(pool) - 1
+        acc = 0.0
+        for idx, weight in enumerate(weights):
+            acc += weight
+            if point <= acc:
+                chosen = idx
+                break
+        out.append(pool.pop(chosen))
+    return out
+
+
+def _pick_deep_sample(alive, limit, stats=None):
+    """Стратифицированная выборка: 70% слотов — share-конфигам.
+
+    Внутри группы приоритет у vless/trojan/hysteria2 и источников, которые
+    раньше давали рабочих серверов.
+    """
     if limit <= 0:
         return list(alive)
+    if stats is None:
+        stats = _load_stats()
     share = [s for s in alive if s.get("type") in SHARE_TYPES]
     other = [s for s in alive if s.get("type") not in SHARE_TYPES]
-    random.shuffle(share)
-    random.shuffle(other)
     share_quota = min(len(share), max(1, int(round(limit * 0.7))))
-    sample = share[:share_quota]
+    sample = _weighted_pick(share, share_quota, stats)
     rest = limit - len(sample)
     if rest > 0:
-        sample.extend(other[:rest])
+        sample.extend(_weighted_pick(other, rest, stats))
     if len(sample) < limit:
         used = set(id(s) for s in sample)
-        extra = [s for s in (share[share_quota:] + other[rest:]) if id(s) not in used]
-        sample.extend(extra[:limit - len(sample)])
+        extra = [s for s in (share + other) if id(s) not in used]
+        sample.extend(_weighted_pick(extra, limit - len(sample), stats))
     random.shuffle(sample)
     return sample
+
 
 
 def _best_per_endpoint(items):
@@ -405,6 +533,7 @@ def _worker(opts, on_done):
         mode = str(opts.get("mode") or "internet")
         deep = bool(opts.get("deep", True))
         max_total = int(opts.get("max_total") or DEFAULT_MAX_TOTAL)
+        stats = _load_stats()
 
         _set(phase="сбор источников", message="читаю публичные списки")
         _log("старт: режим=%s, глубокая проверка=%s" % (mode, "да" if deep else "нет"))
@@ -418,6 +547,7 @@ def _worker(opts, on_done):
         bad = [s for s in cands if not _ready(s)]
         if bad:
             cands = [s for s in cands if _ready(s)]
+            _set(dropped=len(bad))
             _log("отброшено неполных конфигов: %d" % len(bad))
         _set(found=len(cands), message="кандидатов: %d" % len(cands))
         _log("уникальных кандидатов: %d" % len(cands))
@@ -437,7 +567,7 @@ def _worker(opts, on_done):
         working = []
         if deep and alive:
             limit = int(opts.get("deep_limit") or DEFAULT_DEEP_LIMIT)
-            sample = _pick_deep_sample(alive, limit)
+            sample = _pick_deep_sample(alive, limit, stats)
             _set(phase="проверка sing-box", message="проверяю %d через sing-box" % len(sample))
             _log("глубокая проверка: %d (share %d, остальные %d)"
                  % (len(sample),
@@ -473,6 +603,12 @@ def _worker(opts, on_done):
             if len(working) != before:
                 _log("схлопнуто вариантов одного адреса: %d" % (before - len(working)))
 
+        tls_count = sum(1 for s in working if s.get("tls_ok"))
+        _set(tls_ok=tls_count)
+        if deep:
+            _log("TLS-подтверждено: %d" % tls_count)
+        _update_stats(cands, alive, working if deep else [])
+
         for s in working:
             s.pop("_tcp", None)
         _set(working=len(working), phase="добавление", message="добавляю %d" % len(working))
@@ -501,6 +637,7 @@ def start(opts, on_done):
             return False, "сбор уже выполняется"
         _STATE.update(running=True, phase="запуск", message="", found=0,
                       alive=0, working=0, added=0, started=time.time(),
+                      search_links=0, pages=0, dropped=0, tls_ok=0,
                       finished=0.0, log=[])
     threading.Thread(target=_worker, args=(dict(opts), on_done), daemon=True).start()
     return True, ""

@@ -107,6 +107,16 @@ share-конфиги получают приоритет при глубокой
 страниц, поисковики используются как дополнительный источник (многие блокируют
 автоматические запросы, поэтому `SEEDS` остаются основой).
 
+Дополнительно:
+
+- страницы с Clash YAML (`proxies:`) разбираются на vless/vmess/trojan/ss/
+  hysteria2/tuic вместе с ws/grpc-транспортом, Reality и SNI;
+- «голые» `ip:port` берутся только со страниц про прокси/VPN, а служебные
+  порты (DNS, RDP, SMB, базы данных) отбрасываются;
+- урожайность источников запоминается в `autoparse-stats.json`: источники,
+  которые уже давали рабочих серверов, чаще попадают в глубокую проверку.
+
+
 
 > Бесплатные узлы из публичных списков не контролируются вами: владелец узла
 > может видеть и подменять трафик. Не используйте их для банков, почты,
@@ -147,8 +157,8 @@ DNS для этих доменов резолвится через DoH (1.1.1.1)
 Релиз собирается и публикуется автоматически при пуше git-тега:
 
 ```bash
-git tag v1.3.5
-git push origin v1.3.5
+git tag v1.3.6
+git push origin v1.3.6
 ```
 
 GitHub Actions скачает sing-box и wintun, соберёт `NikkiNet-windows-x64.zip`
@@ -161,8 +171,8 @@ GitHub Actions скачает sing-box и wintun, соберёт `NikkiNet-windo
 
 ```powershell
 python installer/make_icon.py
-./installer/build_dist.ps1 -Version 1.3.5 -Compile
-# результат: installer/Output/NikkiNet-Setup-1.3.5.exe
+./installer/build_dist.ps1 -Version 1.3.6 -Compile
+# результат: installer/Output/NikkiNet-Setup-1.3.6.exe
 ```
 
 ## Состав
@@ -177,7 +187,7 @@ python installer/make_icon.py
 | `version.py` | версия приложения + репозиторий обновлений |
 | `appupdate.py` | проверка релизов и самообновление |
 | `netparse.py` | встроенный автосбор серверов (списки + публичные сайты) |
-| `webscan.py` | сканер страниц: ссылки, конфиги, таблицы, base64 |
+| `webscan.py` | сканер страниц: ссылки, конфиги, Clash YAML, таблицы, base64 |
 | `parser-app/` | отдельное приложение-парсер с UI и своим установщиком |
 
 | `export_android.py` | экспорт серверов и подписок для Android (v2rayNG/SFA) |

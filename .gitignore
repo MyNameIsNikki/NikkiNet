@@ -5,7 +5,10 @@ __pycache__/
 # Рантайм-файлы приложения (не входят в репозиторий)
 config.json
 geo.json
+autoparse-stats.json
+autoparse-stats.json.tmp
 .lock
+
 crash.log
 *.log
 .update/

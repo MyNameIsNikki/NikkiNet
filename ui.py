@@ -606,7 +606,7 @@ async function npPoll(){
     const ph=document.getElementById('np-phase');
     ph.textContent=s.phase||(s.running?'работает':'ожидание');
     ph.className='tag'+(s.running?' ok':'');
-    document.getElementById('np-status').textContent='Найдено: '+(s.found||0)+' · живы по TCP: '+(s.alive||0)+' · рабочие: '+(s.working||0)+' · добавлено: '+(s.added||0)+(s.message?' · '+s.message:'');
+    document.getElementById('np-status').textContent='Найдено: '+(s.found||0)+' · живы по TCP: '+(s.alive||0)+' · рабочие: '+(s.working||0)+' · TLS: '+(s.tls_ok||0)+' · добавлено: '+(s.added||0)+' · поиск: '+(s.search_links||0)+' · страниц: '+(s.pages||0)+(s.message?' · '+s.message:'');
     const log=document.getElementById('np-log');
     const lines=(s.log||[]).slice(-8);
     log.innerHTML=lines.map(esc).join('<br>');

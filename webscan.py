@@ -69,6 +69,20 @@ B64_RE = re.compile(r"[A-Za-z0-9+/]{80,}={0,2}")
 TAG_RE = re.compile(r"<[^>]+>")
 SCRIPT_RE = re.compile(r"<(script|style)\b[^>]*>.*?</\1>", re.I | re.S)
 
+# Порты, которые почти никогда не бывают публичными прокси: DNS, почта,
+# SMB, RDP, базы данных. Такие пары «ip:port» на страницах — обычно шум.
+BAD_PROXY_PORTS = {
+    21, 22, 23, 25, 53, 110, 123, 137, 138, 139, 143, 389, 445,
+    993, 995, 1433, 1900, 3306, 3389, 5353, 5432, 6379, 27017,
+}
+
+PROXY_WORDS = (
+    "proxy", "proxies", "socks", "vless", "vmess", "trojan", "shadowsocks",
+    "hysteria", "tuic", "v2ray", "xray", "clash", "outline", "wireguard",
+    "прокси", "туннель", "конфиг", "подписк",
+)
+
+
 DEFAULT_QUERIES = [
     "free vless subscription link",
     "free vmess subscription link",
@@ -318,9 +332,18 @@ def _valid_public_ip(host):
 
 def _valid_port(port):
     try:
-        return 1 <= int(port) <= 65535
+        value = int(port)
     except (TypeError, ValueError):
         return False
+    return 1 <= value <= 65535 and value not in BAD_PROXY_PORTS
+
+
+def _proxy_context(text, url):
+    """Стоит ли вообще вытаскивать «голые» ip:port из этой страницы."""
+    low_url = (url or "").lower()
+    low = (text or "")[:20000].lower()
+    return any(word in low_url or word in low for word in PROXY_WORDS)
+
 
 
 def extract_hostports(text):
@@ -388,6 +411,184 @@ def extract_json_servers(text):
     return out
 
 
+def _valid_public_host(host):
+    host = str(host or "").strip().lower().strip("[]").rstrip(".")
+    if not host or " " in host or "/" in host or len(host) > 253:
+        return ""
+    try:
+        return host if ipaddress.ip_address(host).is_global else ""
+    except ValueError:
+        pass
+    if "." not in host or host.startswith(".") or host.endswith("."):
+        return ""
+    if host.endswith((".local", ".lan", ".internal", ".home", ".arpa")):
+        return ""
+    return host
+
+
+def _clash_blocks(text):
+    """Режет Clash YAML на блоки элементов списка proxies."""
+    if "proxies:" not in (text or "").lower():
+        return []
+    lines = text.splitlines()
+    in_proxies = False
+    blocks = []
+    current = None
+    for raw in lines:
+        line = raw.rstrip()
+        if not line.strip() or line.lstrip().startswith("#"):
+            continue
+        if not in_proxies:
+            if re.match(r"^\s*proxies\s*:\s*$", line, re.I):
+                in_proxies = True
+            continue
+        if not line[0].isspace() and not line.startswith("-"):
+            break
+        match = re.match(r"^(\s*)-\s*(.*)$", line)
+        if match:
+            if current:
+                blocks.append(current)
+            current = [(len(match.group(1)), match.group(2))]
+        elif current is not None:
+            current.append((len(line) - len(line.lstrip()), line.strip()))
+    if current:
+        blocks.append(current)
+    return blocks
+
+
+def _clash_dict(block):
+    """Плоский YAML-блок -> вложенный dict (без внешних зависимостей)."""
+    root = {}
+    stack = [(-1, root)]
+    for indent, content in block:
+        while stack and indent <= stack[-1][0]:
+            stack.pop()
+        if not stack:
+            stack = [(-1, root)]
+        parent = stack[-1][1]
+        if ":" not in content:
+            continue
+        key, value = content.split(":", 1)
+        key = key.strip().strip("'\"")
+        value = value.strip().strip("'\"")
+        if not key:
+            continue
+        if value == "":
+            child = {}
+            parent[key] = child
+            stack.append((indent, child))
+        elif value.lower() in ("true", "false"):
+            parent[key] = value.lower() == "true"
+        else:
+            parent[key] = value
+    return root
+
+
+def _dict_get(mapping, name, default=""):
+    if not isinstance(mapping, dict):
+        return default
+    for key, value in mapping.items():
+        if str(key).lower() == name.lower():
+            return value
+    return default
+
+
+def _clash_server(block):
+    root = _clash_dict(block)
+    typ = str(_dict_get(root, "type")).lower().strip()
+    typ = {"shadowsocks": "ss", "socks5": "socks", "socks5h": "socks",
+           "socks4": "socks", "socks4a": "socks"}.get(typ, typ)
+    if typ not in vp.VALID_TYPES:
+        return None
+    host = _valid_public_host(_dict_get(root, "server"))
+    port_value = _dict_get(root, "port")
+    if not host or not _valid_port(port_value):
+        return None
+    port = int(port_value)
+
+    server = {"type": typ, "host": host, "port": port}
+    name = str(_dict_get(root, "name") or "").strip()
+    server["name"] = (name or "%s://%s:%s" % (typ, host, port))[:120]
+
+    for src, dst in (("uuid", "uuid"), ("password", "password"),
+                     ("cipher", "method"), ("method", "method"),
+                     ("flow", "flow"), ("servername", "sni"), ("sni", "sni"),
+                     ("client-fingerprint", "fp"), ("obfs", "obfs"),
+                     ("obfs-password", "obfs_password"),
+                     ("congestion-controller", "congestion_control")):
+        value = _dict_get(root, src)
+        if value != "" and value is not None:
+            server[dst] = str(value)
+
+    if typ == "ss" and not server.get("method"):
+        server["method"] = str(_dict_get(root, "cipher"))
+
+    reality = _dict_get(root, "reality-opts", {})
+    if isinstance(reality, dict) and reality:
+        server["security"] = "reality"
+        server["pbk"] = str(_dict_get(reality, "public-key"))
+        server["sid"] = str(_dict_get(reality, "short-id"))
+    elif _dict_get(root, "tls") is True:
+        server["security"] = "tls"
+
+    if _dict_get(root, "skip-cert-verify") is True:
+        server["allow_insecure"] = True
+
+    network = str(_dict_get(root, "network")).lower()
+    transport = {"ws": "ws", "grpc": "grpc", "h2": "http",
+                 "http": "http", "tcp": ""}.get(network, network)
+    if transport:
+        server["transport"] = transport
+
+    if transport == "ws":
+        opts = _dict_get(root, "ws-opts", {})
+        if isinstance(opts, dict):
+            path = _dict_get(opts, "path")
+            if path:
+                server["path"] = str(path)
+            headers = _dict_get(opts, "headers", {})
+            if isinstance(headers, dict):
+                host_header = _dict_get(headers, "Host") or _dict_get(headers, "host")
+                if host_header:
+                    server["host_header"] = str(host_header)
+    elif transport == "grpc":
+        opts = _dict_get(root, "grpc-opts", {})
+        if isinstance(opts, dict):
+            service = (_dict_get(opts, "grpc-service-name")
+                       or _dict_get(opts, "service-name"))
+            if service:
+                server["service_name"] = str(service)
+    elif transport == "http":
+        opts = _dict_get(root, "http-opts", {})
+        if isinstance(opts, dict):
+            path = _dict_get(opts, "path")
+            if isinstance(path, list) and path:
+                path = path[0]
+            if path:
+                server["path"] = str(path)
+            headers = _dict_get(opts, "headers", {})
+            if isinstance(headers, dict):
+                host_header = _dict_get(headers, "Host") or _dict_get(headers, "host")
+                if isinstance(host_header, list) and host_header:
+                    host_header = host_header[0]
+                if host_header:
+                    server["host_header"] = str(host_header)
+    return server
+
+
+def extract_clash_servers(text):
+    out = []
+    for block in _clash_blocks(text):
+        try:
+            server = _clash_server(block)
+        except Exception:
+            server = None
+        if server:
+            out.append(server)
+    return out
+
+
+
 def _decode_blobs(text):
     """Декодирует длинные base64-блоки, в которых могут быть конфиги."""
     decoded = []
@@ -437,7 +638,10 @@ def extract_servers(text, default_type="http", url=""):
     def add(item):
         if not item:
             return
-        key = "%s://%s:%s" % (item.get("type"), item.get("host"), item.get("port"))
+        key = "%s://%s:%s|%s|%s|%s|%s|%s|%s" % (
+            item.get("type"), item.get("host"), item.get("port"),
+            item.get("uuid"), item.get("username"), item.get("password"),
+            item.get("method"), item.get("security"), item.get("path"))
         if key not in seen:
             seen.add(key)
             raw.append(item)
@@ -450,12 +654,19 @@ def extract_servers(text, default_type="http", url=""):
         if server:
             add(server)
 
-    for host, port in extract_hostports(text):
+    for item in extract_clash_servers(text):
+        add(item)
+
+    # «голые» ip:port берём только со страниц про прокси/VPN: иначе в список
+    # попадают DNS-серверы, номера версий и случайные адреса из статей.
+    allow_hostports = _proxy_context(text, url)
+
+    for host, port in (extract_hostports(text) if allow_hostports else []):
         add({"type": default_type, "host": host, "port": port,
              "name": "%s:%s" % (host, port)})
 
     # таблицы вида <td>1.2.3.4</td><td>8080</td> ломают regex на сыром HTML
-    for host, port in extract_hostports(plain):
+    for host, port in (extract_hostports(plain) if allow_hostports else []):
         add({"type": default_type, "host": host, "port": port,
              "name": "%s:%s" % (host, port)})
 
@@ -470,9 +681,11 @@ def extract_servers(text, default_type="http", url=""):
                 continue
             if server:
                 add(server)
-        for host, port in extract_hostports(chunk):
-            add({"type": default_type, "host": host, "port": port,
-                 "name": "%s:%s" % (host, port)})
+        if allow_hostports:
+            for host, port in extract_hostports(chunk):
+                add({"type": default_type, "host": host, "port": port,
+                     "name": "%s:%s" % (host, port)})
+
 
     for item in raw:
         item.setdefault("name", "%s://%s:%s" % (
@@ -481,10 +694,19 @@ def extract_servers(text, default_type="http", url=""):
 
 
 def guess_default_type(url, text):
-    low = (url + " " + text[:4000]).lower()
-    if "socks5" in low or "socks4" in low or "/socks" in low:
+    """Тип для «голых» ip:port: сначала смотрим URL, потом текст страницы."""
+    low_url = (url or "").lower()
+    if "socks" in low_url:
+        return "socks"
+    if "http" in low_url or "https" in low_url:
+        return "http"
+    low = (text or "")[:6000].lower()
+    socks_hits = low.count("socks5") + low.count("socks4") + low.count("socks proxy")
+    http_hits = low.count("http proxy") + low.count("https proxy") + low.count("http(s)")
+    if socks_hits > http_hits and socks_hits > 0:
         return "socks"
     return "http"
+
 
 
 # ------------------------------------------------------------------ поиск
