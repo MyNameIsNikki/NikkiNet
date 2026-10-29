@@ -5,6 +5,7 @@ import random
 import re
 import shutil
 import socket
+import ssl
 import subprocess
 import threading
 import time
@@ -870,7 +871,7 @@ def _release_test_port(p):
         _test_ports_in_use.discard(p)
 
 
-def test_outbound(server, timeout=15):
+def test_outbound(server, timeout=15, tls_check=False):
     tag = "test-" + str(random.randint(1000, 9999))
     port = _acquire_test_port()
     ob = build_outbound(server, tag)
@@ -942,12 +943,71 @@ def test_outbound(server, timeout=15):
                 answer += chunk
             latency = round((time.time() - start) * 1000, 1)
             first = answer.split(b"\r\n", 1)[0].decode("latin-1", "ignore")
-            if first.startswith("HTTP/"):
-                status = first.split(" ", 2)[1] if len(first.split(" ", 2)) >= 2 else "0"
-                if status.startswith("2") or status.startswith("3"):
-                    return {"ok": True, "latency_ms": latency, "status": status}
+            if not first.startswith("HTTP/"):
+                return {"ok": False, "error": first or "нет ответа"}
+            status = first.split(" ", 2)[1] if len(first.split(" ", 2)) >= 2 else "0"
+            if not (status.startswith("2") or status.startswith("3")):
                 return {"ok": False, "error": f"HTTP {status}"}
-            return {"ok": False, "error": first or "нет ответа"}
+            if not tls_check:
+                return {"ok": True, "latency_ms": latency, "status": status}
+
+            # Дополнительная проверка TLS: отсекает прозрачные/поддельные прокси.
+            tls_start = time.time()
+            tsock = None
+            try:
+                tsock = socket.create_connection(("127.0.0.1", port), timeout=timeout)
+                tsock.settimeout(timeout)
+                tsock.sendall(
+                    b"CONNECT example.com:443 HTTP/1.1\r\nHost: example.com:443\r\n\r\n"
+                )
+                tresp = b""
+                while b"\r\n\r\n" not in tresp:
+                    chunk = tsock.recv(4096)
+                    if not chunk:
+                        break
+                    tresp += chunk
+                if b" 200 " not in tresp.split(b"\r\n", 1)[0]:
+                    return {"ok": False, "error": "TLS CONNECT не удался"}
+                context = ssl.create_default_context()
+                wrapped = context.wrap_socket(tsock, server_hostname="example.com")
+                tsock = None
+                try:
+                    wrapped.settimeout(timeout)
+                    wrapped.sendall(
+                        b"HEAD / HTTP/1.1\r\nHost: example.com\r\nConnection: close\r\n\r\n"
+                    )
+                    tans = b""
+                    while b"\r\n\r\n" not in tans:
+                        chunk = wrapped.recv(4096)
+                        if not chunk:
+                            break
+                        tans += chunk
+                finally:
+                    try:
+                        wrapped.close()
+                    except Exception:
+                        pass
+                tfirst = tans.split(b"\r\n", 1)[0].decode("latin-1", "ignore")
+                if not tfirst.startswith("HTTP/"):
+                    return {"ok": False, "error": "TLS: нет ответа"}
+                tstatus = tfirst.split(" ", 2)[1] if len(tfirst.split(" ", 2)) >= 2 else "0"
+                if not (tstatus.startswith("2") or tstatus.startswith("3")):
+                    return {"ok": False, "error": "TLS HTTP %s" % tstatus}
+                return {
+                    "ok": True,
+                    "latency_ms": latency,
+                    "status": status,
+                    "tls_ok": True,
+                    "tls_ms": round((time.time() - tls_start) * 1000, 1),
+                }
+            except Exception as exc:
+                return {"ok": False, "error": "TLS: %s" % str(exc)[:80]}
+            finally:
+                if tsock:
+                    try:
+                        tsock.close()
+                    except Exception:
+                        pass
         except Exception as exc:
             return {"ok": False, "error": str(exc)}
         finally:

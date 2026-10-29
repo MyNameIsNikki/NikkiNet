@@ -217,6 +217,36 @@ def _key(s):
     return "%s://%s:%s" % (s.get("type"), s.get("host"), s.get("port"))
 
 
+def _variant_key(s):
+    """Ключ варианта: один адрес может иметь разные uuid/пароли/транспорт."""
+    parts = [
+        s.get("type"), s.get("host"), s.get("port"),
+        s.get("uuid"), s.get("username"), s.get("password"), s.get("method"),
+        s.get("security"), s.get("sni"), s.get("transport"), s.get("path"),
+        s.get("host_header"), s.get("service_name"), s.get("flow"),
+        s.get("pbk"), s.get("sid"),
+    ]
+    return "|".join(str(p or "") for p in parts)
+
+
+def _ready(s):
+    """Проверяет обязательные поля: неполный конфиг всё равно не подключится."""
+    typ = s.get("type")
+    if typ in ("vless", "vmess"):
+        return bool(str(s.get("uuid") or "").strip())
+    if typ == "trojan":
+        return bool(str(s.get("password") or "").strip())
+    if typ == "ss":
+        return bool(str(s.get("method") or "").strip() and str(s.get("password") or ""))
+    if typ == "hysteria2":
+        return bool(str(s.get("password") or "").strip())
+    if typ == "tuic":
+        return bool(str(s.get("uuid") or "").strip())
+    if typ == "wireguard":
+        return bool(str(s.get("privkey") or "").strip() and str(s.get("peer_pubkey") or "").strip())
+    return True
+
+
 def _tcp_one(s, timeout):
     try:
         t0 = time.time()
@@ -242,13 +272,14 @@ def _tcp_filter(cands, workers, timeout):
 
 def _deep_one(s):
     try:
-        res = singbox.test_outbound(s, timeout=DEFAULT_DEEP_TIMEOUT)
+        res = singbox.test_outbound(s, timeout=DEFAULT_DEEP_TIMEOUT, tls_check=True)
     except Exception as exc:
         return False, str(exc)[:80]
     ok = bool(res.get("ok")) and (res.get("latency_ms") or 10 ** 9) <= DEFAULT_CUTOFF_MS
     s["latency"] = int(res["latency_ms"]) if ok else None
     s["latency_ok"] = ok
     s["tested"] = True
+    s["tls_ok"] = bool(res.get("tls_ok")) if ok else False
     return ok, res.get("error") or ""
 
 
@@ -301,8 +332,18 @@ def _collect_sources(opts):
 def _collect_web(opts):
     pages = int(opts.get("max_pages") or DEFAULT_MAX_PAGES)
     depth = int(opts.get("depth") or DEFAULT_DEPTH)
+    seeds = list(SEEDS)
+    if opts.get("use_search", True):
+        queries = list(QUERIES)[:4]
+        found, search_error = webscan.search_many(
+            queries, limit=6, timeout=10.0, log=_log)
+        if search_error:
+            _log("поиск: %s" % search_error[:160])
+        if found:
+            seeds = found + seeds
+        _log("поиск: ссылок %d, к обходу %d" % (len(found), len(seeds)))
     raw, page_stats = webscan.crawl(
-        SEEDS, max_pages=pages, max_depth=depth,
+        seeds, max_pages=pages, max_depth=depth,
         delay=DEFAULT_DELAY, timeout=15.0, respect_robots=True, log=_log)
     out = []
     for item in raw:
@@ -315,11 +356,43 @@ def _collect_web(opts):
     return out
 
 
+def _pick_deep_sample(alive, limit):
+    """Стратифицированная выборка: большинство слотов — share-конфигам."""
+    if limit <= 0:
+        return list(alive)
+    share = [s for s in alive if s.get("type") in SHARE_TYPES]
+    other = [s for s in alive if s.get("type") not in SHARE_TYPES]
+    random.shuffle(share)
+    random.shuffle(other)
+    share_quota = min(len(share), max(1, int(round(limit * 0.7))))
+    sample = share[:share_quota]
+    rest = limit - len(sample)
+    if rest > 0:
+        sample.extend(other[:rest])
+    if len(sample) < limit:
+        used = set(id(s) for s in sample)
+        extra = [s for s in (share[share_quota:] + other[rest:]) if id(s) not in used]
+        sample.extend(extra[:limit - len(sample)])
+    random.shuffle(sample)
+    return sample
+
+
+def _best_per_endpoint(items):
+    """После проверки на один адрес оставляем лучший рабочий вариант."""
+    best = {}
+    for s in items:
+        key = _key(s)
+        current = best.get(key)
+        if current is None or (s.get("latency") or 10 ** 9) < (current.get("latency") or 10 ** 9):
+            best[key] = s
+    return sorted(best.values(), key=lambda s: s.get("latency") or 10 ** 9)
+
+
 def _dedupe(items):
     seen = set()
     out = []
     for s in items:
-        k = _key(s)
+        k = _variant_key(s)
         if k in seen:
             continue
         seen.add(k)
@@ -342,6 +415,10 @@ def _worker(opts, on_done):
             cands.extend(_collect_web(opts))
 
         cands = _dedupe(cands)
+        bad = [s for s in cands if not _ready(s)]
+        if bad:
+            cands = [s for s in cands if _ready(s)]
+            _log("отброшено неполных конфигов: %d" % len(bad))
         _set(found=len(cands), message="кандидатов: %d" % len(cands))
         _log("уникальных кандидатов: %d" % len(cands))
 
@@ -360,12 +437,12 @@ def _worker(opts, on_done):
         working = []
         if deep and alive:
             limit = int(opts.get("deep_limit") or DEFAULT_DEEP_LIMIT)
-            sample = list(alive)
-            random.shuffle(sample)
-            if limit > 0:
-                sample = sample[:limit]
+            sample = _pick_deep_sample(alive, limit)
             _set(phase="проверка sing-box", message="проверяю %d через sing-box" % len(sample))
-            _log("глубокая проверка: %d" % len(sample))
+            _log("глубокая проверка: %d (share %d, остальные %d)"
+                 % (len(sample),
+                    sum(1 for s in sample if s.get("type") in SHARE_TYPES),
+                    sum(1 for s in sample if s.get("type") not in SHARE_TYPES)))
             from concurrent.futures import ThreadPoolExecutor, as_completed
             done = 0
             with ThreadPoolExecutor(max_workers=DEFAULT_DEEP_WORKERS) as ex:
@@ -389,6 +466,12 @@ def _worker(opts, on_done):
             for s in working:
                 s["tested"] = False
                 s["latency_ok"] = False
+
+        if working:
+            before = len(working)
+            working = _best_per_endpoint(working)
+            if len(working) != before:
+                _log("схлопнуто вариантов одного адреса: %d" % (before - len(working)))
 
         for s in working:
             s.pop("_tcp", None)

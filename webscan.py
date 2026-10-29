@@ -191,10 +191,10 @@ class _ResultParser(HTMLParser):
                 self._algo += 1
             elif "b_algo" in cls:
                 self._algo = 1
-        elif tag == "h2" and self._algo:
+        elif tag == "h2":
             self._h2 += 1
         elif tag == "a" and attrs.get("href"):
-            if "result__a" in cls or (self._algo and self._h2):
+            if ("result__a" in cls or "result-link" in cls or self._h2):
                 self._anchor = [attrs["href"], []]
 
     def handle_data(self, data):
@@ -556,7 +556,9 @@ def search(query, limit=12, timeout=15.0):
     tokens = _query_tokens(query)
     engines = (
         ("ddg", "https://html.duckduckgo.com/html/?q=%s&kl=wt-wt" % encoded),
+        ("ddg-lite", "https://lite.duckduckgo.com/lite/?q=%s" % encoded),
         ("bing", "https://www.bing.com/search?q=%s&count=30&setlang=en" % encoded),
+        ("mojeek", "https://www.mojeek.com/search?q=%s" % encoded),
     )
     last_error = ""
     for name, url in engines:
@@ -569,6 +571,39 @@ def search(query, limit=12, timeout=15.0):
             return found, ""
         last_error = name + ": пустая выдача"
     return [], last_error
+
+
+def search_many(queries, limit=6, timeout=10.0, log=None):
+    """Ищет несколько запросов параллельно, возвращает (urls, errors)."""
+    from concurrent.futures import ThreadPoolExecutor
+
+    queries = [q for q in queries if str(q or "").strip()][:8]
+    if not queries:
+        return [], ""
+
+    def one(query):
+        found, error = search(query, limit=limit, timeout=timeout)
+        return query, found, error
+
+    urls = []
+    seen = set()
+    errors = []
+    try:
+        with ThreadPoolExecutor(max_workers=min(3, len(queries))) as ex:
+            results = list(ex.map(one, queries))
+    except Exception as exc:
+        return [], str(exc)[:160]
+    for query, found, error in results:
+        if log:
+            log("поиск «%s»: ссылок %d%s" % (
+                query[:48], len(found), (" · " + error[:80]) if error else ""))
+        if error:
+            errors.append("%s: %s" % (query[:32], error))
+        for url in found:
+            if url not in seen:
+                seen.add(url)
+                urls.append(url)
+    return urls, "; ".join(errors[:3])
 
 
 # ------------------------------------------------------------------ обход
@@ -585,6 +620,7 @@ def crawl(seeds, max_pages=120, max_depth=2, delay=0.7, timeout=15.0,
 
     queue = deque((seed, 0) for seed in seeds)
     visited = set()
+    fetched = 0
     per_site = {}
     per_host_last = {}
     pages = []
@@ -611,7 +647,7 @@ def crawl(seeds, max_pages=120, max_depth=2, delay=0.7, timeout=15.0,
             continue
         if per_site.get(key, 0) >= max_per_site:
             continue
-        if len(visited) >= max_pages:
+        if fetched >= max_pages:
             break
         visited.add(url)
 
@@ -623,6 +659,7 @@ def crawl(seeds, max_pages=120, max_depth=2, delay=0.7, timeout=15.0,
                               "servers": 0, "depth": depth, "error": ""})
                 continue
 
+        fetched += 1
         wait = max(delay, crawl_delay)
         last = per_host_last.get(host, 0.0)
         if last:
