@@ -713,6 +713,7 @@ class Core:
     def _watchdog_loop(self, proxy_port):
         tries = 0
         window_start = time.time()
+        port_down_since = 0.0
         while True:
             time.sleep(2)
             with self.lock:
@@ -720,25 +721,39 @@ class Core:
                     self.running = False
                     return
                 proc = self.proc
-            if proc.poll() is None:
+            alive = proc.poll() is None
+            port_ok = is_port_open("127.0.0.1", proxy_port, timeout=1.0) if alive else False
+            if alive and port_ok:
+                port_down_since = 0.0
                 self._maybe_truncate_log()
                 continue
+            if alive and not port_ok:
+                # процесс жив, но mixed-порт не слушает: зависший sing-box
+                if not port_down_since:
+                    port_down_since = time.time()
+                if time.time() - port_down_since < 8:
+                    continue
+                reason = f"не открывает порт {proxy_port}"
+            else:
+                reason = "завершился"
             with self.lock:
                 if self.stopping or self.proc is None:
                     self.running = False
                     return
                 self.running = False
-            if time.time() - window_start > 120:
+            if time.time() - window_start > 300:
                 tries = 0
                 window_start = time.time()
             tries += 1
-            if tries > 3:
-                self._log("error", "sing-box повторно падает, останавливаю watchdog")
+            if tries > 8:
+                self._log("error", "sing-box не восстанавливается после 8 попыток, watchdog остановлен")
                 self.running = False
                 return
-            self._log("warn", f"sing-box завершился неожиданно, перезапуск ({tries}/3)...")
-            time.sleep(0.5)
+            delay = min(30, 2 ** min(tries - 1, 4))
+            self._log("warn", f"sing-box {reason}, перезапуск ({tries}/8) через {delay}с...")
+            time.sleep(delay)
             self.start(self.last_cfg, proxy_port, force=True)
+
 
     def _maybe_truncate_log(self):
         try:

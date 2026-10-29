@@ -884,38 +884,202 @@ def update_subscription(state, sub):
         _sub_inflight.discard(sid)
 
 
+HEALTH_INTERVAL = 15.0
+HEALTH_TIMEOUT = 7.0
+HEALTH_FAILS_LIMIT = 2
+HEALTH_URLS = (
+    "https://www.gstatic.com/generate_204",
+    "http://cp.cloudflare.com/generate_204",
+)
+_HEALTH = {
+    "fails": 0,
+    "port_fails": 0,
+    "last_ok": 0.0,
+    "last_probe": 0.0,
+    "last_core_restart": 0.0,
+    "last_proxy_check": 0.0,
+    "last_failover": 0.0,
+    "active_fail_id": "",
+    "active_fail_count": 0,
+}
+
+
+def _proxy_probe(timeout=HEALTH_TIMEOUT):
+    """Проверяет интернет через локальный mixed-порт, а не напрямую."""
+    proxy = f"http://{LISTEN_HOST}:{LISTEN_PORT}"
+    opener = urllib.request.build_opener(
+        urllib.request.ProxyHandler({"http": proxy, "https": proxy})
+    )
+    for url in HEALTH_URLS:
+        try:
+            req = urllib.request.Request(
+                url, headers={"User-Agent": "NikkiNet-Health/1.0", "Cache-Control": "no-cache"})
+            with opener.open(req, timeout=timeout) as resp:
+                code = int(getattr(resp, "status", 0) or 0)
+                if 200 <= code < 400:
+                    return True
+        except Exception:
+            continue
+    return False
+
+
+def _ensure_system_proxy(state):
+    """Возвращает системный прокси, если его выключило другое приложение."""
+    if not IS_WINDOWS or not state.system_proxy:
+        return
+    now = time.time()
+    if now - _HEALTH["last_proxy_check"] < 30:
+        return
+    _HEALTH["last_proxy_check"] = now
+    cur = _read_proxy_settings()
+    want = f"{LISTEN_HOST}:{LISTEN_PORT}"
+    if cur and cur.get("ProxyEnable") and want in str(cur.get("ProxyServer") or ""):
+        return
+    ok, msg = set_system_proxy(True, want, state=state)
+    if ok:
+        state.add_log("warn", "Системный прокси был выключен извне — включён снова")
+    else:
+        state.add_log("error", f"Не удалось восстановить системный прокси: {msg}")
+
+
+def _failover(state, reason=""):
+    """Проверяет несколько кандидатов и переключает на реально рабочий."""
+    now = time.time()
+    if now - _HEALTH["last_failover"] < 45:
+        return False
+    _HEALTH["last_failover"] = now
+    act = state.active_server()
+    if state.selection_mode == "auto":
+        state.add_log("warn", f"{reason} Авто-режим: urltest выберет сервер сам")
+        return False
+    if not act:
+        state.add_log("error", "Нет активного сервера для переключения")
+        return False
+    with state.lock:
+        cands = [s for s in state.servers
+                 if s.get("enabled") and s.get("id") != act.get("id")]
+    if not cands:
+        state.add_log("error", "Нет других серверов для переключения")
+        return False
+
+    cc = str(act.get("country") or "").upper()
+
+    def rank(s):
+        return (
+            0 if s.get("latency_ok") else 1,
+            0 if str(s.get("country") or "").upper() == cc else 1,
+            s.get("latency") or 10 ** 9,
+        )
+
+    cands.sort(key=rank)
+    batch = cands[:10]
+    if not batch:
+        return False
+    state.add_log("info", f"Переключение: проверяю {len(batch)} кандидатов...")
+    try:
+        with ThreadPoolExecutor(max_workers=min(4, len(batch))) as ex:
+            list(ex.map(lambda s: _test_one(s, timeout=TEST_TIMEOUT), batch))
+    except Exception as exc:
+        state.add_log("error", f"Ошибка проверки кандидатов: {exc}")
+    good = [s for s in batch if s.get("latency_ok")]
+    if not good:
+        state.add_log("error", "Среди проверенных кандидатов нет рабочего — остаюсь на текущем")
+        return False
+    good.sort(key=lambda s: (0 if str(s.get("country") or "").upper() == cc else 1,
+                             s.get("latency") or 10 ** 9))
+    best = good[0]
+    state.active_server_id = best["id"]
+    fast = False
+    if state.core and state.core.running:
+        try:
+            fast = core_mod.clash_set_selector(core_mod.outbound_tag(best))
+        except Exception:
+            fast = False
+    if not fast and state.reloader:
+        state.reloader.request(force=True)
+    try:
+        save_state(state)
+    except Exception:
+        pass
+    _HEALTH["last_failover"] = time.time()
+    state.add_log(
+        "info",
+        f"Переключение на {best.get('name')} ({best.get('country')}, "
+        f"{best.get('latency')} мс){'' if fast else ' (перезапуск)'}")
+    return True
+
+
 def _active_fallback(state):
-    """Сторож активного сервера: умер → мгновенно переключаемся на лучший живой
-    (приоритет — та же страна), чтобы подключение не висело мёртвым."""
+    """Сторож активного сервера: два провала подряд → переключение."""
     act = state.active_server()
     if not act or not act.get("enabled"):
         return
     try:
-        if _test_one(act):
-            return
+        ok = _test_one(act)
     except Exception:
+        ok = False
+    if ok:
+        _HEALTH["active_fail_id"] = act.get("id") or ""
+        _HEALTH["active_fail_count"] = 0
         return
-    state.add_log("warn", f"Активный сервер {act.get('name')} не отвечает — переключаюсь")
-    with state.lock:
-        cands = [s for s in state.servers
-                 if s.get("enabled") and s.get("latency_ok") and s["id"] != act["id"]]
-    cc = str(act.get("country") or "").upper()
-    same = [s for s in cands if str(s.get("country") or "").upper() == cc]
-    pool = same or cands
-    if not pool:
-        state.add_log("error", "Живых серверов для переключения нет")
+    if _HEALTH["active_fail_id"] != act.get("id"):
+        _HEALTH["active_fail_id"] = act.get("id") or ""
+        _HEALTH["active_fail_count"] = 0
+    _HEALTH["active_fail_count"] += 1
+    count = _HEALTH["active_fail_count"]
+    if count < 2:
+        state.add_log("warn", f"Активный сервер {act.get('name')} не отвечает ({count}/2)")
         return
-    pool.sort(key=lambda s: s.get("latency") or 10 ** 9)
-    best = pool[0]
-    state.active_server_id = best["id"]
-    fast = False
-    if state.core and state.core.running:
-        if core_mod.clash_set_selector(core_mod.outbound_tag(best)):
-            fast = True
-    if not fast and state.reloader:
-        state.reloader.request()
-    save_state(state)
-    state.add_log("info", f"Переключение на {best.get('name')} ({best.get('country')}, {best.get('latency')} мс){'' if fast else ' (перезапуск)'}")
+    _HEALTH["active_fail_count"] = 0
+    state.add_log("warn", f"Активный сервер {act.get('name')} не отвечает — ищу замену")
+    _failover(state, "Активный сервер не отвечает.")
+
+
+def _stability_loop(state):
+    """Фоновая проверка ядра, порта и реального интернета через прокси."""
+    time.sleep(8)
+    state.add_log("info", "Мониторинг соединения запущен (проверка каждые 15 с)")
+    while True:
+        try:
+            core = state.core
+            proc_ok = bool(core and core.running and core.proc and core.proc.poll() is None)
+            if not proc_ok:
+                now = time.time()
+                if now - _HEALTH["last_core_restart"] > 30:
+                    _HEALTH["last_core_restart"] = now
+                    state.add_log("warn", "Ядро не запущено — перезапускаю")
+                    if state.reloader:
+                        state.reloader.request(force=True)
+                _HEALTH["fails"] = 0
+                _HEALTH["port_fails"] = 0
+            else:
+                if not core_mod.is_port_open(LISTEN_HOST, LISTEN_PORT):
+                    _HEALTH["port_fails"] += 1
+                    if (_HEALTH["port_fails"] >= 2
+                            and time.time() - _HEALTH["last_core_restart"] > 30):
+                        _HEALTH["port_fails"] = 0
+                        _HEALTH["last_core_restart"] = time.time()
+                        state.add_log("warn", f"Порт {LISTEN_PORT} не отвечает — перезапускаю ядро")
+                        if state.reloader:
+                            state.reloader.request(force=True)
+                else:
+                    _HEALTH["port_fails"] = 0
+                    _ensure_system_proxy(state)
+                    _HEALTH["last_probe"] = time.time()
+                    if _proxy_probe():
+                        _HEALTH["fails"] = 0
+                        _HEALTH["last_ok"] = time.time()
+                    else:
+                        _HEALTH["fails"] += 1
+                        fails = _HEALTH["fails"]
+                        state.add_log("warn", f"Проверка соединения не прошла ({fails}/{HEALTH_FAILS_LIMIT})")
+                        if fails >= HEALTH_FAILS_LIMIT:
+                            _HEALTH["fails"] = 0
+                            _failover(state, "Прокси не пропускает трафик.")
+        except Exception as exc:
+            state.add_log("error", f"Мониторинг соединения: {exc}")
+        time.sleep(HEALTH_INTERVAL)
+
 
 
 def auto_updater_loop(state):
@@ -1685,6 +1849,7 @@ def open_app_window(url):
 
 
 def run():
+    global ADMIN_PORT
     state = load_state()
     want_vpn = "--vpn" in sys.argv
     if want_vpn:
@@ -1692,7 +1857,19 @@ def run():
 
     state.core = core_mod.Core(log_cb=state.add_log)
     state.reloader = Reloader(state)
-    admin_srv = AdminServer((ADMIN_HOST, ADMIN_PORT), AdminHandler, state)
+    admin_srv = None
+    for _port in range(ADMIN_PORT, ADMIN_PORT + 20):
+        try:
+            admin_srv = AdminServer((ADMIN_HOST, _port), AdminHandler, state)
+            if _port != ADMIN_PORT:
+                state.add_log("warn", f"Порт {ADMIN_PORT} занят — интерфейс на {_port}")
+            ADMIN_PORT = _port
+            break
+        except OSError:
+            continue
+    if admin_srv is None:
+        state.add_log("error", f"Не удалось открыть порт интерфейса {ADMIN_PORT}-{ADMIN_PORT + 19}")
+        return
 
     for x in state.subs:
         if "проверяю" in str(x.get("last_status", "")):
@@ -1761,6 +1938,7 @@ def run():
 
     threading.Thread(target=admin_srv.serve_forever, daemon=True).start()
     threading.Thread(target=auto_updater_loop, args=(state,), daemon=True).start()
+    threading.Thread(target=_stability_loop, args=(state,), daemon=True).start()
     appupdate.start_background(
         lambda upd: state.add_log("info", f"Доступно обновление v{upd['version']} — обновитесь из панели (баннер сверху)")
     )
