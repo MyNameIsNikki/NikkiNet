@@ -97,24 +97,24 @@ jobs:
           if [ -z "$apk" ]; then
             apk=$(find sfa/clients/android/app/build/outputs/apk/other/release -name '*.apk' | head -1)
           fi
-          cp "$apk" out/NikkiNet-Mobile-1.0.0.apk
+          cp "$apk" out/NikkiNet-Mobile-1.0.1.apk
           ls -lh out
 
       - name: Upload APK artifact
         uses: actions/upload-artifact@v4
         with:
           name: NikkiNet-Mobile-APK
-          path: out/NikkiNet-Mobile-1.0.0.apk
+          path: out/NikkiNet-Mobile-1.0.1.apk
 
       - name: Publish release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: mobile-v1.0.0
-          name: NikkiNet Mobile 1.0.0
+          tag_name: mobile-v1.0.1
+          name: NikkiNet Mobile 1.0.1
           body: |
             NikkiNet Mobile — Android VPN-клиент на базе sing-box.
 
             Установка: скачайте APK, разрешите установку из неизвестных источников,
             добавьте свои серверы или подписку в приложении.
-          files: out/NikkiNet-Mobile-1.0.0.apk
+          files: out/NikkiNet-Mobile-1.0.1.apk
           generate_release_notes: false

@@ -9,9 +9,14 @@ import os
 import re
 import sys
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import theme  # noqa: E402
+
 root = os.path.abspath(sys.argv[1] if len(sys.argv) > 1 else ".")
 app = os.path.join(root, "app")
 gradle = os.path.join(app, "build.gradle.kts")
+version_name = os.environ.get("NIKKINET_MOBILE_VERSION", "1.0.1")
+version_code = os.environ.get("NIKKINET_MOBILE_CODE", "2")
 
 if not os.path.isfile(gradle):
     sys.exit("not a sing-box-for-android checkout: %s" % root)
@@ -47,8 +52,10 @@ for name in os.listdir(res):
 version_file = os.path.join(root, "version.properties")
 if os.path.isfile(version_file):
     text = open(version_file, encoding="utf-8").read()
-    text = re.sub(r"^VERSION_CODE=.*$", "VERSION_CODE=1", text, flags=re.M)
-    text = re.sub(r"^VERSION_NAME=.*$", "VERSION_NAME=1.0.0", text, flags=re.M)
+    text = re.sub(r"^VERSION_CODE=.*$", "VERSION_CODE=" + version_code, text, flags=re.M)
+    text = re.sub(r"^VERSION_NAME=.*$", "VERSION_NAME=" + version_name, text, flags=re.M)
     open(version_file, "w", encoding="utf-8").write(text)
 
-print("rebranded", root)
+theme.apply(app)
+
+print("rebranded", root, "version", version_name)
