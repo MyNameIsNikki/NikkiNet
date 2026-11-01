@@ -29,6 +29,12 @@ WINTUN_URL = "https://www.wintun.net/builds/wintun-0.14.1.zip"
 
 CREATE_NO_WINDOW = 0x08000000
 OUTBOUND_TEST_TARGET = "example.com:80"
+AI_PROBE_TARGETS = (
+    ("chatgpt.com", "/"),
+    ("auth.openai.com", "/"),
+    ("gemini.google.com", "/"),
+    ("accounts.google.com", "/"),
+)
 
 CLASH_HOST = "127.0.0.1"
 CLASH_PORT = 9090
@@ -91,6 +97,17 @@ AI_DOMAINS = [
     "chub.ai",
     "jasper.ai",
     "writesonic.com",
+]
+
+# Две группы, для которых можно выбрать отдельные серверы:
+# ChatGPT/OpenAI и Gemini/Google AI блокируются по-разному.
+AI_CHAT_DOMAINS = [
+    "openai.com", "chatgpt.com", "oaistatic.com", "oaiusercontent.com",
+    "openai.azure.com", "anthropic.com", "claude.ai",
+]
+AI_GEMINI_DOMAINS = [
+    "gemini.google.com", "generativeai.google", "ai.google.dev",
+    "bard.google.com", "makersuite.google.com", "aistudio.google.com",
 ]
 
 MAX_LOG_SIZE = 64 * 1024 * 1024
@@ -378,7 +395,7 @@ def proxy_group_tag(selection_mode):
     return TAG_AUTO if selection_mode == "auto" else TAG_MAIN
 
 
-def build_config(servers, active_id, rules, unmatched, vpn, proxy_port, selection_mode="manual", lan=None, ai_mode=False):
+def build_config(servers, active_id, rules, unmatched, vpn, proxy_port, selection_mode="manual", lan=None, ai_mode=False, ai_server_id=None, ai_chat_id=None, ai_gemini_id=None):
     outbounds = [
         {"type": "direct", "tag": TAG_DIRECT},
         {"type": "block", "tag": TAG_BLOCK},
@@ -455,6 +472,11 @@ def build_config(servers, active_id, rules, unmatched, vpn, proxy_port, selectio
         })
 
     proxy_out = proxy_group_tag(selection_mode) if have_groups else TAG_DIRECT
+    # Отдельный сервер для AI: если выбран и доступен, AI-домены и их DNS идут через него,
+    # остальной трафик остаётся на основном сервере.
+    ai_out = tag_by_id.get(str(ai_server_id or "")) or proxy_out
+    ai_chat_out = tag_by_id.get(str(ai_chat_id or "")) or ai_out
+    ai_gemini_out = tag_by_id.get(str(ai_gemini_id or "")) or ai_out
     route_rules = [
         {"action": "route", "outbound": TAG_DIRECT, "ip_is_private": True},
         {"action": "route", "outbound": TAG_DIRECT, "domain_suffix": ["localhost"]},
@@ -481,7 +503,17 @@ def build_config(servers, active_id, rules, unmatched, vpn, proxy_port, selectio
     if ai_mode:
         route_rules.append({
             "action": "route",
-            "outbound": proxy_out,
+            "outbound": ai_chat_out,
+            "domain_suffix": list(AI_CHAT_DOMAINS),
+        })
+        route_rules.append({
+            "action": "route",
+            "outbound": ai_gemini_out,
+            "domain_suffix": list(AI_GEMINI_DOMAINS),
+        })
+        route_rules.append({
+            "action": "route",
+            "outbound": ai_out,
             "domain_suffix": list(AI_DOMAINS),
         })
 
@@ -509,7 +541,7 @@ def build_config(servers, active_id, rules, unmatched, vpn, proxy_port, selectio
             "type": "https",
             "tag": TAG_DNS_AI,
             "server": "1.1.1.1",
-            "detour": proxy_out,
+            "detour": ai_out,
         }))
         dns_rules.append({"domain_suffix": list(AI_DOMAINS), "server": TAG_DNS_AI})
 
@@ -1053,3 +1085,195 @@ def test_outbound(server, timeout=15, tls_check=False):
                     os.remove(p)
             except Exception:
                 pass
+
+
+def probe_http(server, host, path="/", port=443, timeout=15):
+    """Проверить HTTPS-страницу через конкретный сервер.
+
+    Возвращает HTTP-статус даже для 403/503 (это ответ Cloudflare/сайта),
+    чтобы вызывающий код мог отличить «нет соединения» от «IP заблокирован».
+    """
+    tag = "probe-" + str(random.randint(1000, 9999))
+    test_port = _acquire_test_port()
+    ob = build_outbound(server, tag)
+    if not ob:
+        _release_test_port(test_port)
+        return {"ok": False, "error": "неподдерживаемый тип: %s" % server.get("type")}
+    is_endpoint = isinstance(ob, tuple) and ob[0] == "endpoint"
+    cfg = {
+        "log": {"level": "error", "timestamp": False},
+        "dns": {"servers": [{"type": "local", "tag": "dns"}], "final": "dns", "strategy": "ipv4_only"},
+        "inbounds": [{"type": "mixed", "tag": "in", "listen": "127.0.0.1", "listen_port": test_port}],
+        "outbounds": [
+            {"type": "direct", "tag": "direct"},
+            {"type": "block", "tag": "block"},
+        ],
+        "route": {"rules": [], "final": tag, "default_domain_resolver": "dns"},
+    }
+    if is_endpoint:
+        cfg["endpoints"] = [ob[1]]
+    else:
+        cfg["outbounds"].append(ob)
+    cfg_path = os.path.join(TOOLS_DIR, "probe-%d.json" % test_port)
+    log_path = os.path.join(TOOLS_DIR, "probe-%d.log" % test_port)
+    proc = None
+    logf = None
+    try:
+        with open(cfg_path, "w", encoding="utf-8") as fh:
+            json_dump(fh, cfg)
+        logf = open(log_path, "w", encoding="utf-8", errors="ignore")
+        proc = subprocess.Popen(
+            [SINGBOX_EXE, "run", "-c", cfg_path, "-D", TOOLS_DIR],
+            stdout=logf, stderr=subprocess.STDOUT, creationflags=CREATE_NO_WINDOW,
+        )
+        _assign_job(proc)
+        deadline = time.time() + 8
+        while time.time() < deadline and not is_port_open("127.0.0.1", test_port, 0.3):
+            if proc.poll() is not None:
+                break
+            time.sleep(0.2)
+        if not is_port_open("127.0.0.1", test_port):
+            return {"ok": False, "error": "не удалось поднять тестовый инстанс"}
+        start = time.time()
+        sock = None
+        wrapped = None
+        try:
+            sock = socket.create_connection(("127.0.0.1", test_port), timeout=timeout)
+            sock.settimeout(timeout)
+            target = "%s:%d" % (host, port)
+            sock.sendall(("CONNECT %s HTTP/1.1\r\nHost: %s\r\n\r\n" % (target, target)).encode())
+            head = b""
+            while b"\r\n\r\n" not in head:
+                chunk = sock.recv(4096)
+                if not chunk:
+                    break
+                head += chunk
+            first = head.split(b"\r\n", 1)[0].decode("latin-1", "ignore")
+            if " 200 " not in first:
+                return {"ok": False, "error": first or "CONNECT не удался"}
+            context = ssl.create_default_context()
+            wrapped = context.wrap_socket(sock, server_hostname=host)
+            sock = None
+            wrapped.settimeout(timeout)
+            request = (
+                "GET %s HTTP/1.1\r\n"
+                "Host: %s\r\n"
+                "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36\r\n"
+                "Accept: text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8\r\n"
+                "Accept-Language: en-US,en;q=0.9\r\n"
+                "Connection: close\r\n\r\n"
+            ) % (path, host)
+            wrapped.sendall(request.encode())
+            answer = b""
+            while b"\r\n\r\n" not in answer:
+                chunk = wrapped.recv(4096)
+                if not chunk:
+                    break
+                answer += chunk
+            line = answer.split(b"\r\n", 1)[0].decode("latin-1", "ignore")
+            if not line.startswith("HTTP/"):
+                return {"ok": False, "error": line or "нет ответа"}
+            parts = line.split(" ", 2)
+            status = parts[1] if len(parts) >= 2 else "0"
+            body = b""
+            try:
+                wrapped.settimeout(min(6, timeout))
+                while len(body) < 16000:
+                    chunk = wrapped.recv(4096)
+                    if not chunk:
+                        break
+                    body += chunk
+            except Exception:
+                pass
+            low = (answer + body).decode("utf-8", "ignore").lower()
+            challenge = (
+                "just a moment" in low
+                or "cf-chl" in low
+                or "challenge-platform" in low
+                or "enable javascript and cookies to continue" in low
+            )
+            blocked = (
+                "access denied" in low
+                or "sorry, you have been blocked" in low
+                or "error 1020" in low
+                or "cf-error-details" in low
+            )
+            return {
+                "ok": True,
+                "status": status,
+                "latency_ms": round((time.time() - start) * 1000, 1),
+                "tls_ok": True,
+                "challenge": bool(challenge),
+                "blocked": bool(blocked),
+            }
+        except Exception as exc:
+            return {"ok": False, "error": str(exc)[:160]}
+        finally:
+            for obj in (wrapped, sock):
+                if obj:
+                    try:
+                        obj.close()
+                    except Exception:
+                        pass
+    finally:
+        _release_test_port(test_port)
+        try:
+            if logf:
+                logf.close()
+        except Exception:
+            pass
+        if proc:
+            try:
+                proc.terminate()
+                proc.wait(timeout=5)
+            except Exception:
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
+        for p in (cfg_path, log_path):
+            try:
+                if os.path.exists(p):
+                    os.remove(p)
+            except Exception:
+                pass
+
+
+def ai_probe(server, timeout=15):
+    """Проверить, пускает ли сервер на ChatGPT и Gemini (учитывая Cloudflare-челлендж)."""
+    checks = {}
+    latencies = []
+    for host, path in AI_PROBE_TARGETS:
+        result = probe_http(server, host, path=path, timeout=timeout)
+        checks[host] = result
+        if result.get("latency_ms"):
+            latencies.append(result["latency_ms"])
+
+    def good(host):
+        result = checks.get(host) or {}
+        status = str(result.get("status") or "")
+        return bool(result.get("ok")) and (
+            status.startswith("2")
+            or status.startswith("3")
+            or (result.get("challenge") and not result.get("blocked"))
+        )
+
+    chat_ok = good("chatgpt.com") and good("auth.openai.com")
+    gemini_ok = good("gemini.google.com") and good("accounts.google.com")
+    bad = []
+    for host, result in checks.items():
+        if not good(host):
+            status = str(result.get("status") or "")
+            if result.get("blocked"):
+                why = "заблокирован Cloudflare"
+            else:
+                why = status or result.get("error") or "нет ответа"
+            bad.append("%s: %s" % (host, why))
+    return {
+        "ok": bool(chat_ok or gemini_ok),
+        "chatgpt": bool(chat_ok),
+        "gemini": bool(gemini_ok),
+        "checks": checks,
+        "latency_ms": max(latencies) if latencies else None,
+        "error": "; ".join(bad)[:300],
+    }

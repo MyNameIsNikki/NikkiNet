@@ -12,7 +12,7 @@ import threading
 import time
 import urllib.request
 import uuid
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
@@ -121,6 +121,9 @@ class State:
     system_proxy: bool = False
     vpn: bool = False
     ai_mode: bool = False
+    ai_server_id: str = ""
+    ai_chat_id: str = ""
+    ai_gemini_id: str = ""
     lan: dict = None
     connected_since: float = 0.0
     orig_proxy: dict = None
@@ -174,6 +177,9 @@ def load_state():
             st.system_proxy = data.get("system_proxy", False)
             st.vpn = data.get("vpn", False)
             st.ai_mode = bool(data.get("ai_mode", False))
+            st.ai_server_id = str(data.get("ai_server_id") or "")
+            st.ai_chat_id = str(data.get("ai_chat_id") or "")
+            st.ai_gemini_id = str(data.get("ai_gemini_id") or "")
             st.connected_since = float(data.get("connected_since") or 0.0)
             st.orig_proxy = data.get("orig_proxy")
             st.warp_reg = data.get("warp_reg")
@@ -200,6 +206,9 @@ def save_state(state):
             "system_proxy": state.system_proxy,
             "vpn": state.vpn,
             "ai_mode": bool(state.ai_mode),
+            "ai_server_id": str(state.ai_server_id or ""),
+            "ai_chat_id": str(state.ai_chat_id or ""),
+            "ai_gemini_id": str(state.ai_gemini_id or ""),
             "connected_since": state.connected_since,
             "orig_proxy": state.orig_proxy,
             "warp_reg": state.warp_reg,
@@ -402,7 +411,9 @@ def _ps_elevated(ps, tag):
 def do_reload(state, force=False):
     cfg = core_mod.build_config(
         state.servers, state.active_server_id, state.rules, state.unmatched, state.vpn, LISTEN_PORT,
-        state.selection_mode, lan=state.lan, ai_mode=state.ai_mode
+        state.selection_mode, lan=state.lan, ai_mode=state.ai_mode,
+        ai_server_id=state.ai_server_id, ai_chat_id=state.ai_chat_id,
+        ai_gemini_id=state.ai_gemini_id
     )
     return state.core.start(cfg, LISTEN_PORT, force=force)
 
@@ -445,7 +456,9 @@ class Reloader:
         for _attempt in range(4):
             cfg = core_mod.build_config(
                 st.servers, st.active_server_id, st.rules, st.unmatched, st.vpn, LISTEN_PORT,
-                st.selection_mode, lan=st.lan, ai_mode=st.ai_mode
+                st.selection_mode, lan=st.lan, ai_mode=st.ai_mode,
+                ai_server_id=st.ai_server_id, ai_chat_id=st.ai_chat_id,
+                ai_gemini_id=st.ai_gemini_id
             )
             running = bool(st.core.running and st.core.proc and st.core.proc.poll() is None)
             if not force and running and st.core.cfg_hash == core_mod.config_hash(cfg):
@@ -903,6 +916,21 @@ _HEALTH = {
     "active_fail_count": 0,
 }
 
+_AI_SCAN = {
+    "running": False,
+    "phase": "idle",
+    "message": "",
+    "tested": 0,
+    "total": 0,
+    "good": 0,
+    "chat": 0,
+    "gemini": 0,
+    "started": 0.0,
+    "finished": 0.0,
+    "log": [],
+}
+_AI_SCAN_LOCK = threading.Lock()
+
 
 def _proxy_probe(timeout=HEALTH_TIMEOUT):
     """Проверяет интернет через локальный mixed-порт, а не напрямую."""
@@ -1124,6 +1152,148 @@ def _apply_update_async(state):
     threading.Thread(target=worker, daemon=True).start()
 
 
+def _ai_scan_log(message):
+    with _AI_SCAN_LOCK:
+        _AI_SCAN["log"].append(time.strftime("%H:%M:%S") + " " + str(message))
+        if len(_AI_SCAN["log"]) > 40:
+            _AI_SCAN["log"] = _AI_SCAN["log"][-40:]
+        _AI_SCAN["message"] = str(message)
+
+
+def _ai_scan_status():
+    with _AI_SCAN_LOCK:
+        data = dict(_AI_SCAN)
+        data["log"] = list(_AI_SCAN["log"])
+    data["elapsed"] = round(time.time() - data["started"], 1) if data.get("started") and data.get("running") else 0
+    return data
+
+
+def _ai_scan_candidates(state, limit):
+    share = {"vless", "vmess", "trojan", "ss", "hysteria2", "tuic"}
+    plain = {"http", "https", "socks"}
+    seen = set()
+    rows = []
+    for s in state.servers:
+        if not s.get("enabled") or not s.get("host") or not s.get("port"):
+            continue
+        key = (s.get("type"), s.get("host"), s.get("port"))
+        if key in seen:
+            continue
+        seen.add(key)
+        rows.append(s)
+
+    def rank(s):
+        return (
+            0 if s.get("id") in (state.active_server_id, state.ai_server_id) else 1,
+            0 if s.get("latency_ok") else 1,
+            0 if s.get("type") in plain else 1,
+            0 if s.get("type") in share else 1,
+            s.get("latency") or 10 ** 9,
+        )
+
+    rows.sort(key=rank)
+    return rows[:max(20, int(limit or 160))]
+
+
+def _ai_scan_worker(state, limit):
+    try:
+        cands = _ai_scan_candidates(state, limit)
+        with _AI_SCAN_LOCK:
+            _AI_SCAN["phase"] = "проверка"
+            _AI_SCAN["total"] = len(cands)
+        _ai_scan_log(f"проверяю {len(cands)} серверов на ChatGPT и Gemini...")
+        good = []
+        chat_good = []
+        gemini_good = []
+        tested = 0
+        with ThreadPoolExecutor(max_workers=6) as ex:
+            futures = {ex.submit(core_mod.ai_probe, s, 8): s for s in cands}
+            for future in as_completed(futures):
+                srv = futures[future]
+                tested += 1
+                try:
+                    res = future.result()
+                except Exception as exc:
+                    res = {"ok": False, "error": str(exc)[:100]}
+                with _AI_SCAN_LOCK:
+                    _AI_SCAN["tested"] = tested
+                if res.get("chatgpt"):
+                    chat_good.append((res.get("latency_ms") or 10 ** 9, srv))
+                if res.get("gemini"):
+                    gemini_good.append((res.get("latency_ms") or 10 ** 9, srv))
+                if res.get("ok"):
+                    good.append((res.get("latency_ms") or 10 ** 9, srv))
+                    with _AI_SCAN_LOCK:
+                        _AI_SCAN["good"] = len(good)
+                        _AI_SCAN["chat"] = len(chat_good)
+                        _AI_SCAN["gemini"] = len(gemini_good)
+                    _ai_scan_log(
+                        "подходит: %s (%s, %s:%s) chat=%s gemini=%s" % (
+                            srv.get("name") or srv.get("host"), srv.get("type"),
+                            srv.get("host"), srv.get("port"),
+                            "да" if res.get("chatgpt") else "нет",
+                            "да" if res.get("gemini") else "нет",
+                        )
+                    )
+                if tested % 10 == 0:
+                    _ai_scan_log(f"проверено {tested}/{len(cands)}, найдено {len(good)}")
+        if not good:
+            with _AI_SCAN_LOCK:
+                _AI_SCAN["phase"] = "не найдено"
+            _ai_scan_log("рабочих серверов для ChatGPT/Gemini не найдено — они блокируют публичные IP")
+            return
+        chat_good.sort(key=lambda item: item[0])
+        gemini_good.sort(key=lambda item: item[0])
+        best_chat = chat_good[0][1] if chat_good else None
+        best_gemini = gemini_good[0][1] if gemini_good else None
+        if best_chat:
+            state.ai_chat_id = best_chat["id"]
+        if best_gemini:
+            state.ai_gemini_id = best_gemini["id"]
+        state.ai_server_id = (best_chat or best_gemini)["id"]
+        save_state(state)
+        if state.reloader:
+            state.reloader.request(force=True)
+        with _AI_SCAN_LOCK:
+            _AI_SCAN["phase"] = "готово"
+        parts = []
+        if best_chat:
+            parts.append("ChatGPT: " + str(best_chat.get("name") or best_chat.get("host")))
+        if best_gemini:
+            parts.append("Gemini: " + str(best_gemini.get("name") or best_gemini.get("host")))
+        _ai_scan_log("выбрано — " + "; ".join(parts))
+        state.add_log("info", "AI-серверы: " + "; ".join(parts))
+    except Exception as exc:
+        with _AI_SCAN_LOCK:
+            _AI_SCAN["phase"] = "ошибка"
+        _ai_scan_log(f"ошибка: {exc}")
+    finally:
+        with _AI_SCAN_LOCK:
+            _AI_SCAN["running"] = False
+            _AI_SCAN["finished"] = time.time()
+
+
+def start_ai_scan(state, limit=220):
+    with _AI_SCAN_LOCK:
+        if _AI_SCAN["running"]:
+            return False, "проверка уже выполняется"
+        _AI_SCAN.update({
+            "running": True,
+            "phase": "запуск",
+            "message": "",
+            "tested": 0,
+            "total": 0,
+            "good": 0,
+            "chat": 0,
+            "gemini": 0,
+            "started": time.time(),
+            "finished": 0.0,
+            "log": [],
+        })
+    threading.Thread(target=_ai_scan_worker, args=(state, limit), daemon=True).start()
+    return True, ""
+
+
 def _start_autoparse(state, opts):
     """Запускает фоновый автосбор и добавляет найденные серверы в NikkiNet."""
     def on_done(servers):
@@ -1219,6 +1389,13 @@ class AdminHandler(BaseHTTPRequestHandler):
             self._json(appupdate.status())
         elif self.path == "/api/parse/status":
             self._json(netparse.status())
+        elif self.path == "/api/ai/status":
+            data = _ai_scan_status()
+            data["ai_server_id"] = str(state.ai_server_id or "")
+            data["ai_server_name"] = (state.server(state.ai_server_id) or {}).get("name", "")
+            data["ai_chat_name"] = (state.server(state.ai_chat_id) or {}).get("name", "")
+            data["ai_gemini_name"] = (state.server(state.ai_gemini_id) or {}).get("name", "")
+            self._json(data)
         else:
             self.send_error(404)
 
@@ -1240,6 +1417,12 @@ class AdminHandler(BaseHTTPRequestHandler):
             "vpn": state.vpn,
             "ai_mode": bool(state.ai_mode),
             "ai_domains": len(core_mod.AI_DOMAINS),
+            "ai_server_id": str(state.ai_server_id or ""),
+            "ai_server_name": (state.server(state.ai_server_id) or {}).get("name", ""),
+            "ai_chat_id": str(state.ai_chat_id or ""),
+            "ai_chat_name": (state.server(state.ai_chat_id) or {}).get("name", ""),
+            "ai_gemini_id": str(state.ai_gemini_id or ""),
+            "ai_gemini_name": (state.server(state.ai_gemini_id) or {}).get("name", ""),
             "lan": _norm_lan(state.lan),
             "lan_ip": lan_ip(),
             "lan_port": core_mod.LAN_PORT,
@@ -1706,6 +1889,39 @@ class AdminHandler(BaseHTTPRequestHandler):
                 res["warning"] = ("Доступ включён, но порт не открыт в брандмауэре: " + fw_err[:160])
             return res
 
+        if p == "/api/ai/pick":
+            try:
+                limit = int(b.get("limit") or 220)
+            except (TypeError, ValueError):
+                limit = 220
+            limit = max(20, min(600, limit))
+            ok, err = start_ai_scan(state, limit)
+            if not ok:
+                return {"ok": False, "error": err, "status": _ai_scan_status()}
+            state.add_log("info", "Подбор сервера для AI запущен")
+            return {"ok": True, "status": _ai_scan_status()}
+
+        if p == "/api/ai/server":
+            sid = str(b.get("id") or "")
+            chat_id = str(b.get("chat_id") or "")
+            gemini_id = str(b.get("gemini_id") or "")
+            for value in (sid, chat_id, gemini_id):
+                if value and not state.server(value):
+                    return {"ok": False, "error": "сервер не найден"}
+            if "id" in b:
+                state.ai_server_id = sid
+            if "chat_id" in b:
+                state.ai_chat_id = chat_id
+            if "gemini_id" in b:
+                state.ai_gemini_id = gemini_id
+            if state.ai_mode:
+                ok, msg = do_reload(state, force=True)
+                if not ok:
+                    return {"ok": False, "error": msg[:250]}
+            save_state(state)
+            return {"ok": True, "ai_server_id": state.ai_server_id,
+                    "ai_chat_id": state.ai_chat_id, "ai_gemini_id": state.ai_gemini_id}
+
         if p == "/api/ai":
             want = bool(b.get("enabled"))
             prev = state.ai_mode
@@ -1722,6 +1938,11 @@ class AdminHandler(BaseHTTPRequestHandler):
             res = {"ok": True, "ai_mode": want, "domains": len(core_mod.AI_DOMAINS)}
             if want and not state.servers:
                 res["warning"] = "Нет серверов: AI-трафик пойдёт напрямую"
+            elif want and not state.ai_server_id:
+                started, _err = start_ai_scan(state, 220)
+                if started:
+                    res["scan_started"] = True
+                    res["warning"] = "Подбираю сервер для ChatGPT/Gemini — это может занять пару минут"
             return res
 
         if p == "/api/reload":

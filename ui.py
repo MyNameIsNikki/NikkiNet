@@ -259,6 +259,11 @@ ADMIN_HTML = """<!DOCTYPE html>
         <label class="switch"><input type="checkbox" id="ai-toggle" onchange="setAi(this.checked)"> AI-режим (ИИ через прокси)</label>
         <span class="tag" id="ai-state">выключен</span>
       </div>
+      <div class="row" style="margin-top:8px">
+        <span class="span">Сервер для ИИ:</span><b id="ai-chat-name">ChatGPT: основной</b><b id="ai-gemini-name">Gemini: основной</b>
+        <button class="sm" id="ai-pick-btn" onclick="pickAiServer()">Подобрать</button>
+        <span class="muted" id="ai-scan-note"></span>
+      </div>
       <div class="muted" id="listener-note" style="margin-top:8px"></div>
     </div>
 
@@ -544,13 +549,47 @@ async function setMode(m){try{await api('/api/mode','POST',{unmatched:m});refres
 async function setSelMode(m){try{await api('/api/mode','POST',{selection_mode:m});refresh();}catch(e){toast(e.message);}}
 async function setSystemProxy(v){try{await api('/api/system-proxy','POST',{enabled:v});refresh();}catch(e){document.getElementById('sp-toggle').checked=!v;toast(e.message);}}
 async function setVpn(v){try{const r=await api('/api/vpn','POST',{enabled:v});if(r.relaunching){toast(r.message||'Перезапуск...');return;}refresh();}catch(e){document.getElementById('vpn-toggle').checked=!v;toast(e.message);}}
-async function setAi(v){try{const r=await api('/api/ai','POST',{enabled:v});if(r.warning)toast(r.warning);refresh();}catch(e){document.getElementById('ai-toggle').checked=!v;toast(e.message);}}
+async function setAi(v){try{const r=await api('/api/ai','POST',{enabled:v});if(r.warning)toast(r.warning);refresh();if(r.scan_started)aiPoll();}catch(e){document.getElementById('ai-toggle').checked=!v;toast(e.message);}}
 function renderAi(){
   const t=document.getElementById('ai-state');
   if(!t)return;
   const on=!!state.ai_mode;
   t.textContent=on?('включён · '+(state.ai_domains||0)+' доменов'):'выключен';
   t.className='tag'+(on?' ok':'');
+  const n=document.getElementById('ai-chat-name');
+  if(n)n.textContent='ChatGPT: '+(state.ai_chat_name||'основной');
+  const g=document.getElementById('ai-gemini-name');
+  if(g)g.textContent='Gemini: '+(state.ai_gemini_name||'основной');
+}
+let aiTimer=null,aiLastPhase='';
+async function pickAiServer(){
+  try{
+    const r=await api('/api/ai/pick','POST',{limit:220});
+    if(!r.ok){toast(r.error||'Не удалось запустить проверку');aiPoll();return;}
+    toast('Проверяю серверы на доступ к ChatGPT и Gemini...');
+    aiLastPhase='';aiPoll();
+  }catch(e){toast(e.message);}
+}
+async function aiPoll(){
+  clearTimeout(aiTimer);
+  try{
+    const st=await api('/api/ai/status');
+    const note=document.getElementById('ai-scan-note');
+    const btn=document.getElementById('ai-pick-btn');
+    if(note){
+      if(st.running)note.textContent='проверено '+st.tested+'/'+st.total+' · найдено '+st.good;
+      else if(st.phase==='не найдено')note.textContent='не найдено (ChatGPT блокирует публичные IP)';
+      else if(st.phase==='готово')note.textContent='ChatGPT: '+(st.ai_chat_name||'основной')+' · Gemini: '+(st.ai_gemini_name||'основной');
+      else note.textContent='';
+    }
+    if(btn)btn.disabled=!!st.running;
+    if(st.running){aiTimer=setTimeout(aiPoll,2000);return;}
+    if(st.phase!==aiLastPhase){
+      if(st.phase==='готово'){toast('AI: ChatGPT — '+(st.ai_chat_name||'основной')+', Gemini — '+(st.ai_gemini_name||'основной'));refresh();}
+      else if(st.phase==='не найдено'){toast('Рабочих серверов для ChatGPT/Gemini не найдено');}
+      aiLastPhase=st.phase;
+    }
+  }catch(e){/* панель могла перезапускаться */}
 }
 function renderLan(){
   const l=state.lan||{};
