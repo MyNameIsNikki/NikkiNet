@@ -28,6 +28,7 @@ SINGBOX_URL = (
 WINTUN_URL = "https://www.wintun.net/builds/wintun-0.14.1.zip"
 
 CREATE_NO_WINDOW = 0x08000000
+MAX_OUTBOUNDS = 40
 OUTBOUND_TEST_TARGET = "example.com:80"
 AI_PROBE_TARGETS = (
     ("chatgpt.com", "/"),
@@ -395,6 +396,49 @@ def proxy_group_tag(selection_mode):
     return TAG_AUTO if selection_mode == "auto" else TAG_MAIN
 
 
+def _outbound_pool(servers, active_id, rules, ai_server_id=None, ai_chat_id=None, ai_gemini_id=None, limit=MAX_OUTBOUNDS):
+    """Ограничивает конфиг рабочим пулом, а не всеми 800+ серверами."""
+    forced = []
+    for sid in (active_id, ai_server_id, ai_chat_id, ai_gemini_id):
+        sid = str(sid or "")
+        if sid and sid not in forced:
+            forced.append(sid)
+    for r in rules or []:
+        if r.get("action") == "server":
+            sid = str(r.get("server_id") or "")
+            if sid and sid not in forced:
+                forced.append(sid)
+    by_id = {str(s.get("id") or ""): s for s in servers}
+    selected = []
+    seen = set()
+    for sid in forced:
+        s = by_id.get(sid)
+        if not s or not s.get("enabled") or s.get("quarantined"):
+            continue
+        if sid in seen:
+            continue
+        seen.add(sid)
+        selected.append(s)
+    rest = [
+        s for s in servers
+        if s.get("enabled") and not s.get("quarantined")
+        and str(s.get("id") or "") not in seen
+        and s.get("host") and s.get("port")
+    ]
+    rest.sort(key=lambda s: (
+        0 if s.get("latency_ok") else 1,
+        0 if s.get("tested") else 1,
+        s.get("latency") or 10 ** 9,
+    ))
+    cap = max(int(limit or MAX_OUTBOUNDS), len(selected))
+    for s in rest:
+        if len(selected) >= cap:
+            break
+        selected.append(s)
+        seen.add(str(s.get("id") or ""))
+    return selected
+
+
 def build_config(servers, active_id, rules, unmatched, vpn, proxy_port, selection_mode="manual", lan=None, ai_mode=False, ai_server_id=None, ai_chat_id=None, ai_gemini_id=None):
     outbounds = [
         {"type": "direct", "tag": TAG_DIRECT},
@@ -404,7 +448,7 @@ def build_config(servers, active_id, rules, unmatched, vpn, proxy_port, selectio
     tag_by_id = {}
     active_tag = None
     server_tags = []
-    for s in servers:
+    for s in _outbound_pool(servers, active_id, rules, ai_server_id, ai_chat_id, ai_gemini_id):
         if not s.get("enabled"):
             continue
         tag = outbound_tag(s)
@@ -475,8 +519,8 @@ def build_config(servers, active_id, rules, unmatched, vpn, proxy_port, selectio
     # Отдельный сервер для AI: если выбран и доступен, AI-домены и их DNS идут через него,
     # остальной трафик остаётся на основном сервере.
     ai_out = tag_by_id.get(str(ai_server_id or "")) or proxy_out
-    ai_chat_out = tag_by_id.get(str(ai_chat_id or "")) or ai_out
-    ai_gemini_out = tag_by_id.get(str(ai_gemini_id or "")) or ai_out
+    ai_chat_out = tag_by_id.get(str(ai_chat_id or "")) or proxy_out
+    ai_gemini_out = tag_by_id.get(str(ai_gemini_id or "")) or proxy_out
     route_rules = [
         {"action": "route", "outbound": TAG_DIRECT, "ip_is_private": True},
         {"action": "route", "outbound": TAG_DIRECT, "domain_suffix": ["localhost"]},
@@ -543,6 +587,20 @@ def build_config(servers, active_id, rules, unmatched, vpn, proxy_port, selectio
             "server": "1.1.1.1",
             "detour": ai_out,
         }))
+        dns_servers.append(_clean({
+            "type": "https",
+            "tag": "dns-chat",
+            "server": "1.1.1.1",
+            "detour": ai_chat_out,
+        }))
+        dns_servers.append(_clean({
+            "type": "https",
+            "tag": "dns-gemini",
+            "server": "1.1.1.1",
+            "detour": ai_gemini_out,
+        }))
+        dns_rules.append({"domain_suffix": list(AI_CHAT_DOMAINS), "server": "dns-chat"})
+        dns_rules.append({"domain_suffix": list(AI_GEMINI_DOMAINS), "server": "dns-gemini"})
         dns_rules.append({"domain_suffix": list(AI_DOMAINS), "server": TAG_DNS_AI})
 
     dns_cfg = {"servers": dns_servers, "final": TAG_DNS, "strategy": "ipv4_only"}
@@ -682,20 +740,21 @@ class Core:
                 if self.cfg_hash == h:
                     self.last_cfg = config
                     return True, "конфиг не изменился"
-            self.last_cfg = config
             if not os.path.isfile(SINGBOX_EXE):
                 self.error = "sing-box не загружен"
+                return False, self.error
+            # Сначала проверяем конфиг, и только потом трогаем рабочий MAIN_CONFIG.
+            # Иначе невалидный конфиг затирает последний хороший и ломает watchdog.
+            ok, msg = self.check_config(config)
+            if not ok:
+                self.error = f"Конфиг не прошёл проверку: {msg[:300]}"
+                self._log("error", self.error)
                 return False, self.error
             try:
                 with open(MAIN_CONFIG, "w", encoding="utf-8") as fh:
                     json_dump(fh, config)
             except Exception as exc:
                 self.error = f"Ошибка записи конфига: {exc}"
-                return False, self.error
-            ok, msg = self.check_config()
-            if not ok:
-                self.error = f"Конфиг не прошёл проверку: {msg[:300]}"
-                self._log("error", self.error)
                 return False, self.error
             self.stopping = False
             self.stop_locked()
@@ -730,6 +789,7 @@ class Core:
                     self.running = True
                     self.error = ""
                     self.cfg_hash = h
+                    self.last_cfg = config
                     self.stopping = False
                     self._log("info", "sing-box работает (порт %s)" % proxy_port)
                     if self._watchdog is None or not self._watchdog.is_alive():
@@ -1239,15 +1299,150 @@ def probe_http(server, host, path="/", port=443, timeout=15):
                 pass
 
 
+def _probe_one(port, host, path="/", timeout=15):
+    """Один HTTPS-запрос через уже поднятый mixed-порт."""
+    sock = None
+    wrapped = None
+    try:
+        start = time.time()
+        sock = socket.create_connection(("127.0.0.1", port), timeout=timeout)
+        sock.settimeout(timeout)
+        target = "%s:443" % host
+        sock.sendall(("CONNECT %s HTTP/1.1\r\nHost: %s\r\n\r\n" % (target, target)).encode())
+        head = b""
+        while b"\r\n\r\n" not in head:
+            chunk = sock.recv(4096)
+            if not chunk:
+                break
+            head += chunk
+        line = head.split(b"\r\n", 1)[0].decode("latin-1", "ignore")
+        if " 200 " not in line:
+            return {"ok": False, "error": line or "CONNECT не удался"}
+        context = ssl.create_default_context()
+        wrapped = context.wrap_socket(sock, server_hostname=host)
+        sock = None
+        wrapped.settimeout(timeout)
+        request = (
+            "GET %s HTTP/1.1\r\n"
+            "Host: %s\r\n"
+            "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36\r\n"
+            "Accept: text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8\r\n"
+            "Accept-Language: en-US,en;q=0.9\r\n"
+            "Connection: close\r\n\r\n"
+        ) % (path, host)
+        wrapped.sendall(request.encode())
+        answer = b""
+        while b"\r\n\r\n" not in answer:
+            chunk = wrapped.recv(4096)
+            if not chunk:
+                break
+            answer += chunk
+        body = b""
+        try:
+            wrapped.settimeout(min(6, timeout))
+            while len(body) < 16000:
+                chunk = wrapped.recv(4096)
+                if not chunk:
+                    break
+                body += chunk
+        except Exception:
+            pass
+        first = answer.split(b"\r\n", 1)[0].decode("latin-1", "ignore")
+        if not first.startswith("HTTP/"):
+            return {"ok": False, "error": first or "нет ответа"}
+        parts = first.split(" ", 2)
+        status = parts[1] if len(parts) >= 2 else "0"
+        low = (answer + body).decode("utf-8", "ignore").lower()
+        challenge = ("just a moment" in low or "cf-chl" in low
+                     or "challenge-platform" in low
+                     or "enable javascript and cookies to continue" in low)
+        blocked = ("access denied" in low or "sorry, you have been blocked" in low
+                   or "error 1020" in low or "cf-error-details" in low)
+        return {"ok": True, "status": status,
+                "latency_ms": round((time.time() - start) * 1000, 1),
+                "tls_ok": True, "challenge": bool(challenge), "blocked": bool(blocked)}
+    except Exception as exc:
+        return {"ok": False, "error": str(exc)[:160]}
+    finally:
+        for obj in (wrapped, sock):
+            if obj:
+                try:
+                    obj.close()
+                except Exception:
+                    pass
+
+
+def probe_many(server, targets, timeout=15):
+    """Один временный sing-box на сервер, несколько HTTPS-проверок."""
+    tag = "probe-" + str(random.randint(1000, 9999))
+    test_port = _acquire_test_port()
+    ob = build_outbound(server, tag)
+    if not ob:
+        _release_test_port(test_port)
+        return {host: {"ok": False, "error": "неподдерживаемый тип"} for host, _ in targets}
+    is_endpoint = isinstance(ob, tuple) and ob[0] == "endpoint"
+    cfg = {
+        "log": {"level": "error", "timestamp": False},
+        "dns": {"servers": [{"type": "local", "tag": "dns"}], "final": "dns", "strategy": "ipv4_only"},
+        "inbounds": [{"type": "mixed", "tag": "in", "listen": "127.0.0.1", "listen_port": test_port}],
+        "outbounds": [{"type": "direct", "tag": "direct"}, {"type": "block", "tag": "block"}],
+        "route": {"rules": [], "final": tag, "default_domain_resolver": "dns"},
+    }
+    if is_endpoint:
+        cfg["endpoints"] = [ob[1]]
+    else:
+        cfg["outbounds"].append(ob)
+    cfg_path = os.path.join(TOOLS_DIR, "probe-%d.json" % test_port)
+    log_path = os.path.join(TOOLS_DIR, "probe-%d.log" % test_port)
+    proc = None
+    logf = None
+    try:
+        with open(cfg_path, "w", encoding="utf-8") as fh:
+            json_dump(fh, cfg)
+        logf = open(log_path, "w", encoding="utf-8", errors="ignore")
+        proc = subprocess.Popen(
+            [SINGBOX_EXE, "run", "-c", cfg_path, "-D", TOOLS_DIR],
+            stdout=logf, stderr=subprocess.STDOUT, creationflags=CREATE_NO_WINDOW,
+        )
+        _assign_job(proc)
+        deadline = time.time() + 8
+        while time.time() < deadline and not is_port_open("127.0.0.1", test_port, 0.3):
+            if proc.poll() is not None:
+                break
+            time.sleep(0.2)
+        if not is_port_open("127.0.0.1", test_port):
+            return {host: {"ok": False, "error": "не удалось поднять тестовый инстанс"}
+                    for host, _ in targets}
+        return {host: _probe_one(test_port, host, path, timeout)
+                for host, path in targets}
+    finally:
+        _release_test_port(test_port)
+        try:
+            if logf:
+                logf.close()
+        except Exception:
+            pass
+        if proc:
+            try:
+                proc.terminate()
+                proc.wait(timeout=5)
+            except Exception:
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
+        for p in (cfg_path, log_path):
+            try:
+                if os.path.exists(p):
+                    os.remove(p)
+            except Exception:
+                pass
+
+
 def ai_probe(server, timeout=15):
     """Проверить, пускает ли сервер на ChatGPT и Gemini (учитывая Cloudflare-челлендж)."""
-    checks = {}
-    latencies = []
-    for host, path in AI_PROBE_TARGETS:
-        result = probe_http(server, host, path=path, timeout=timeout)
-        checks[host] = result
-        if result.get("latency_ms"):
-            latencies.append(result["latency_ms"])
+    checks = probe_many(server, AI_PROBE_TARGETS, timeout)
+    latencies = [r.get("latency_ms") for r in checks.values() if r.get("latency_ms")]
 
     def good(host):
         result = checks.get(host) or {}

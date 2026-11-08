@@ -5,6 +5,7 @@ import os
 import random
 import re
 import secrets
+import shutil
 import socket as _socket
 import subprocess
 import sys
@@ -46,6 +47,9 @@ ADMIN_HOST = "127.0.0.1"
 ADMIN_PORT = 8000
 MAX_LOGS = 400
 CREATE_NO_WINDOW = 0x08000000
+MAX_OUTBOUNDS = 40
+STATE_BACKUPS = 3
+_STATE_WRITE_LOCK = threading.Lock()
 
 LATENCY_CUTOFF_MS = 1500
 SUB_IMPORT_CAP = 600
@@ -58,6 +62,7 @@ SERVER_FIELDS = [
     "path", "host_header", "service_name", "enabled", "source", "latency", "latency_ok", "tested", "country", "added_ts",
     "obfs", "obfs_password", "up", "down", "alpn", "allow_insecure", "congestion_control",
     "privkey", "peer_pubkey", "local_addrs", "reserved", "mtu",
+    "dead_count", "last_fail_ts", "quarantined",
 ]
 
 try:
@@ -100,6 +105,15 @@ def _norm_server(s):
     d["enabled"] = True if d.get("enabled") is None else bool(d["enabled"])
     d["latency_ok"] = bool(d.get("latency_ok"))
     d["tested"] = bool(d.get("tested"))
+    try:
+        d["dead_count"] = max(0, int(d.get("dead_count") or 0))
+    except (TypeError, ValueError):
+        d["dead_count"] = 0
+    try:
+        d["last_fail_ts"] = float(d.get("last_fail_ts") or 0.0)
+    except (TypeError, ValueError):
+        d["last_fail_ts"] = 0.0
+    d["quarantined"] = bool(d.get("quarantined"))
     if not d.get("source"):
         d["source"] = "manual"
     if not d.get("country"):
@@ -160,15 +174,28 @@ def default_state():
     return st
 
 
+def _backup_path(index):
+    return CONFIG_FILE + (".bak" if index == 1 else ".bak%d" % index)
+
+
 def load_state():
-    if os.path.exists(CONFIG_FILE):
+    """Читает config.json, при повреждении — последний валидный бэкап."""
+    paths = [CONFIG_FILE] + [_backup_path(i) for i in range(1, STATE_BACKUPS + 1)]
+    for path in paths:
+        if not os.path.exists(path):
+            continue
         try:
-            with open(CONFIG_FILE, "r", encoding="utf-8") as fh:
+            with open(path, "r", encoding="utf-8") as fh:
                 data = json.load(fh)
+            if not isinstance(data, dict):
+                continue
+            servers = data.get("servers")
+            if not isinstance(servers, list) or not servers:
+                continue
             st = State()
-            st.servers = [_norm_server(s) for s in data.get("servers", [])]
-            st.subs = data.get("subs", [])
-            st.rules = data.get("rules", [])
+            st.servers = [_norm_server(s) for s in servers]
+            st.subs = data.get("subs", []) if isinstance(data.get("subs"), list) else []
+            st.rules = data.get("rules", []) if isinstance(data.get("rules"), list) else []
             st.active_server_id = data.get("active_server_id", "")
             st.unmatched = data.get("unmatched", "proxy")
             st.selection_mode = data.get("selection_mode", "manual")
@@ -185,12 +212,14 @@ def load_state():
             st.warp_reg = data.get("warp_reg")
             st.lan = _norm_lan(data.get("lan"))
             if not st.servers:
-                return default_state()
+                continue
             if not st.server(st.active_server_id):
                 st.active_server_id = st.servers[0]["id"]
+            if path != CONFIG_FILE:
+                print("load_state: восстановлен из %s" % path)
             return st
-        except Exception:
-            pass
+        except Exception as exc:
+            print("load_state: %s повреждён: %s" % (path, exc))
     return default_state()
 
 
@@ -214,11 +243,29 @@ def save_state(state):
             "warp_reg": state.warp_reg,
             "lan": state.lan or {},
         }
-    try:
-        with open(CONFIG_FILE, "w", encoding="utf-8") as fh:
-            json.dump(data, fh, ensure_ascii=False, indent=2)
-    except Exception as exc:
-        print("save_state error:", exc)
+    tmp = CONFIG_FILE + ".tmp"
+    with _STATE_WRITE_LOCK:
+        try:
+            with open(tmp, "w", encoding="utf-8") as fh:
+                json.dump(data, fh, ensure_ascii=False, indent=2)
+                fh.flush()
+                os.fsync(fh.fileno())
+            with open(tmp, "r", encoding="utf-8") as fh:
+                json.load(fh)
+            for i in range(STATE_BACKUPS, 1, -1):
+                src = _backup_path(i - 1)
+                if os.path.exists(src):
+                    os.replace(src, _backup_path(i))
+            if os.path.exists(CONFIG_FILE):
+                os.replace(CONFIG_FILE, _backup_path(1))
+            os.replace(tmp, CONFIG_FILE)
+        except Exception as exc:
+            print("save_state error:", exc)
+            try:
+                if os.path.exists(tmp):
+                    os.remove(tmp)
+            except Exception:
+                pass
 
 
 LAN_USER_DEFAULT = "nikki"
@@ -733,20 +780,70 @@ def _dedupe_key(s):
     return f"{s.get('type')}://{s.get('host')}:{s.get('port')}"
 
 
+def _variant_key(s):
+    """Ключ варианта: один адрес может иметь разные uuid/пароли/транспорт."""
+    fields = (
+        "type", "host", "port", "uuid", "username", "password", "method",
+        "security", "sni", "transport", "path", "host_header", "service_name",
+        "flow", "pbk", "sid",
+    )
+    return "|".join(str(s.get(k) or "") for k in fields)
+
+
+def _quarantine(s, now):
+    try:
+        s["dead_count"] = int(s.get("dead_count") or 0) + 1
+    except (TypeError, ValueError):
+        s["dead_count"] = 1
+    s["last_fail_ts"] = now
+    if s["dead_count"] >= 2:
+        s["quarantined"] = True
+        s["enabled"] = False
+
+
+def _repair_active(state):
+    active = state.server(state.active_server_id)
+    if active and active.get("enabled") and not active.get("quarantined"):
+        return
+    alive = [s for s in state.servers if s.get("enabled") and not s.get("quarantined")]
+    alive.sort(key=lambda s: (0 if s.get("latency_ok") else 1, s.get("latency") or 10 ** 9))
+    state.active_server_id = alive[0]["id"] if alive else ""
+
+
+def _cleanup_dead(state, orphan_min=30):
+    """Помечает нерабочие серверы карантином, ничего не удаляя безвозвратно."""
+    changed = 0
+    now = time.time()
+    with state.lock:
+        for s in state.servers:
+            if s.get("source") == "warp":
+                continue
+            if s.get("tested") and not s.get("latency_ok"):
+                if s.get("quarantined") and not s.get("enabled"):
+                    continue
+                _quarantine(s, now)
+                changed += 1
+        _repair_active(state)
+    if changed:
+        save_state(state)
+        state.add_log("info", f"Карантин: помечено нерабочими {changed} серверов")
+    return changed
+
+
 def add_servers(state, new_servers, source="manual"):
     added_list = []
     with state.lock:
-        existing = {_dedupe_key(s) for s in state.servers}
+        existing = {_variant_key(s) for s in state.servers}
         for ns in new_servers:
             ns = _norm_server(ns)
             ns["source"] = source
             ns["added_ts"] = time.time()
-            if _dedupe_key(ns) in existing:
+            if _variant_key(ns) in existing:
                 continue
             if not ns.get("host") or not ns.get("port"):
                 continue
             state.servers.append(ns)
-            existing.add(_dedupe_key(ns))
+            existing.add(_variant_key(ns))
             added_list.append(ns)
             if not state.server(state.active_server_id):
                 state.active_server_id = ns["id"]
@@ -754,25 +851,33 @@ def add_servers(state, new_servers, source="manual"):
 
 
 def _test_one(srv, timeout=TEST_TIMEOUT):
-    res = core_mod.test_outbound(srv, timeout=timeout)
-    ok = bool(res.get("ok")) and (res.get("latency_ms") or 10 ** 9) <= LATENCY_CUTOFF_MS
+    res = core_mod.test_outbound(srv, timeout=timeout, tls_check=True)
+    ok = bool(res.get("ok")) and bool(res.get("tls_ok")) and (res.get("latency_ms") or 10 ** 9) <= LATENCY_CUTOFF_MS
     srv["latency"] = res.get("latency_ms") if ok else None
     srv["latency_ok"] = ok
     srv["tested"] = True
+    if ok:
+        srv["enabled"] = True
+        srv["quarantined"] = False
+        srv["dead_count"] = 0
+        srv["last_fail_ts"] = 0.0
     return ok
 
 
 def _test_and_filter(state, servers, timeout=TEST_TIMEOUT):
-    """Тестирует серверы; >1500мс и мёртвые сразу удаляет из пула. Возвращает выживших."""
+    """Тестирует серверы и помещает нерабочие в карантин, не удаляя их."""
     if not servers:
         return []
     with ThreadPoolExecutor(max_workers=TEST_WORKERS) as ex:
         list(ex.map(lambda s: _test_one(s, timeout), servers))
-    failed_ids = {s["id"] for s in servers if not s["latency_ok"]}
-    if failed_ids:
+    failed = [s for s in servers if not s.get("latency_ok")]
+    if failed:
+        now = time.time()
         with state.lock:
-            state.servers = [s for s in state.servers if s["id"] not in failed_ids]
-    return [s for s in servers if s["latency_ok"]]
+            for s in failed:
+                _quarantine(s, now)
+            _repair_active(state)
+    return [s for s in servers if s.get("latency_ok")]
 
 
 # ---------- GeoIP (ip-api.com batch + кэш) ----------
@@ -918,6 +1023,7 @@ _HEALTH = {
 
 _AI_SCAN = {
     "running": False,
+    "cancel": False,
     "phase": "idle",
     "message": "",
     "tested": 0,
@@ -1206,9 +1312,15 @@ def _ai_scan_worker(state, limit):
         chat_good = []
         gemini_good = []
         tested = 0
+        cancelled = False
         with ThreadPoolExecutor(max_workers=6) as ex:
             futures = {ex.submit(core_mod.ai_probe, s, 8): s for s in cands}
             for future in as_completed(futures):
+                with _AI_SCAN_LOCK:
+                    if _AI_SCAN.get("cancel"):
+                        cancelled = True
+                if cancelled:
+                    break
                 srv = futures[future]
                 tested += 1
                 try:
@@ -1304,6 +1416,8 @@ def _start_autoparse(state, opts):
         state.add_log("info", f"Автосбор: добавлено {len(added)} серверов")
         return len(added)
 
+    opts = dict(opts or {})
+    opts["existing"] = {_variant_key(s) for s in state.servers}
     ok, err = netparse.start(opts, on_done)
     return {"ok": ok, "error": err, "status": netparse.status()}
 
@@ -1460,6 +1574,10 @@ class AdminHandler(BaseHTTPRequestHandler):
                 return {"ok": False, "error": "нет доступного обновления"}
             _apply_update_async(state)
             return {"ok": True, "message": "обновление скачивается, приложение перезапустится"}
+
+        if p == "/api/parse/stop":
+            netparse.stop()
+            return {"ok": True, "status": netparse.status()}
 
         if p == "/api/parse/start":
             mode = b.get("mode") if b.get("mode") in ("internet", "lists") else "internet"
@@ -1921,6 +2039,12 @@ class AdminHandler(BaseHTTPRequestHandler):
             save_state(state)
             return {"ok": True, "ai_server_id": state.ai_server_id,
                     "ai_chat_id": state.ai_chat_id, "ai_gemini_id": state.ai_gemini_id}
+
+        if p == "/api/ai/stop":
+            with _AI_SCAN_LOCK:
+                _AI_SCAN["cancel"] = True
+            _ai_scan_log("подбор AI-сервера остановлен")
+            return {"ok": True, "status": _ai_scan_status()}
 
         if p == "/api/ai":
             want = bool(b.get("enabled"))

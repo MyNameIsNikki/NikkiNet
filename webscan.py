@@ -112,8 +112,33 @@ def _opener():
     return urllib.request.build_opener(urllib.request.ProxyHandler({}))
 
 
+def _private_host(host):
+    """Не даём краулеру ходить на localhost/частные адреса (SSRF)."""
+    host = str(host or "").strip().lower().rstrip(".")
+    if not host:
+        return True
+    if host in ("localhost", "localhost.localdomain") or host.endswith((
+            ".local", ".lan", ".internal", ".home", ".arpa")):
+        return True
+    try:
+        ip = ipaddress.ip_address(host)
+        return not ip.is_global
+    except ValueError:
+        return False
+
+
+def _safe_public_url(url):
+    try:
+        parts = urllib.parse.urlsplit(url)
+        return parts.scheme in ("http", "https") and not _private_host(parts.hostname or "")
+    except Exception:
+        return False
+
+
 def fetch(url, timeout=15.0, max_bytes=2000000):
     """Возвращает (ok, text, content_type, final_url, error)."""
+    if not _safe_public_url(url):
+        return False, "", "", url, "запрещённый адрес"
     req = urllib.request.Request(url, headers={
         "User-Agent": UA,
         "Accept": "text/html,application/json,text/plain,*/*;q=0.8",
@@ -831,7 +856,8 @@ def search_many(queries, limit=6, timeout=10.0, log=None):
 # ------------------------------------------------------------------ обход
 
 def crawl(seeds, max_pages=120, max_depth=2, delay=0.7, timeout=15.0,
-          respect_robots=True, max_per_site=20, log=None):
+          respect_robots=True, max_per_site=20, log=None, max_seconds=600.0,
+          cancel=None):
     """Обходит сайты и возвращает (raw_servers, pages)."""
     seeds = [s for s in seeds if s]
     seed_keys = set()
@@ -848,12 +874,19 @@ def crawl(seeds, max_pages=120, max_depth=2, delay=0.7, timeout=15.0,
     pages = []
     raw = []
     stop = False
+    deadline = time.time() + max(30.0, float(max_seconds or 600.0))
 
     def note(message):
         if log:
             log(message)
 
     while queue and not stop:
+        if cancel is not None and cancel.is_set():
+            note("обход остановлен пользователем")
+            break
+        if time.time() > deadline:
+            note("обход остановлен по лимиту времени")
+            break
         url, depth = queue.popleft()
         url = urllib.parse.urldefrag(url)[0]
         if url in visited or depth > max_depth:
@@ -862,7 +895,7 @@ def crawl(seeds, max_pages=120, max_depth=2, delay=0.7, timeout=15.0,
         if parts.scheme not in ("http", "https"):
             continue
         host = (parts.hostname or "").lower()
-        if not host:
+        if not host or _private_host(host):
             continue
         key = site_key(host)
         if seed_keys and key not in seed_keys:

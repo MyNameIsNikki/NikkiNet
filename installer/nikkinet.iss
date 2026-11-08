@@ -63,8 +63,6 @@ Filename: "powershell.exe"; Parameters: "-NoProfile -ExecutionPolicy Bypass -Com
 [UninstallDelete]
 Type: filesandordirs; Name: "{app}\.update"
 Type: filesandordirs; Name: "{app}\__pycache__"
-Type: files; Name: "{app}\config.json"
-Type: files; Name: "{app}\geo.json"
 Type: files; Name: "{app}\.lock"
 Type: files; Name: "{app}\crash.log"
 Type: files; Name: "{app}\sing-box-config.json"

@@ -116,6 +116,7 @@ _HOST_RE = re.compile(r"^[a-z0-9]([a-z0-9\.\-]{0,251}[a-z0-9])?$", re.I)
 # ---------------------------------------------------------------- состояние
 
 _LOCK = threading.Lock()
+_CANCEL = threading.Event()
 _STATE = {
     "running": False,
     "phase": "ожидание",
@@ -291,19 +292,27 @@ def _source_score(name, stats):
 
 
 def _update_stats(cands, alive, working):
-    """Накапливает урожайность источников между запусками."""
+    """Обновляет урожайность источников с затуханием (EWMA)."""
+    from collections import Counter
+
     stats = _load_stats()
     now = int(time.time())
-    touched = set()
-    for group, field in ((cands, "candidates"), (alive, "alive"), (working, "working")):
-        for s in group:
-            name = _source_name(s)
-            rec = stats.setdefault(name, {})
-            rec[field] = int(rec.get(field) or 0) + 1
-            rec["last_ts"] = now
-            touched.add(name)
-    for name in touched:
-        rec = stats.get(name) or {}
+    cand_counts = Counter(_source_name(s) for s in cands)
+    alive_counts = Counter(_source_name(s) for s in alive)
+    work_counts = Counter(_source_name(s) for s in working)
+    names = set(cand_counts) | set(alive_counts) | set(work_counts)
+    for name in names:
+        rec = stats.setdefault(name, {})
+        for field, count in (
+                ("candidates", cand_counts.get(name, 0)),
+                ("alive", alive_counts.get(name, 0)),
+                ("working", work_counts.get(name, 0))):
+            try:
+                old = float(rec.get(field) or 0)
+            except (TypeError, ValueError):
+                old = 0.0
+            rec[field] = int(round(old * 0.65 + count))
+        rec["last_ts"] = now
         rec["runs"] = int(rec.get("runs") or 0) + 1
     _save_stats(stats)
     ranked = sorted(
@@ -433,9 +442,11 @@ def _collect_web(opts):
             seeds = found[:12] + seeds + found[12:]
         _set(search_links=len(found))
         _log("поиск: ссылок %d, к обходу %d" % (len(found), len(seeds)))
+    seeds = [s for s in seeds if webscan._safe_public_url(s)]
     raw, page_stats = webscan.crawl(
         seeds, max_pages=pages, max_depth=depth,
-        delay=DEFAULT_DELAY, timeout=15.0, respect_robots=True, log=_log)
+        delay=DEFAULT_DELAY, timeout=15.0, respect_robots=True, log=_log,
+        max_seconds=600.0, cancel=_CANCEL)
     out = []
     for item in raw:
         s = _normalize(item, str(item.get("_source") or "web"))
@@ -528,6 +539,14 @@ def _dedupe(items):
     return out
 
 
+def _cancel_requested():
+    if not _CANCEL.is_set():
+        return False
+    _set(phase="остановлено", message="сбор остановлен", finished=time.time())
+    _log("сбор остановлен пользователем")
+    return True
+
+
 def _worker(opts, on_done):
     try:
         mode = str(opts.get("mode") or "internet")
@@ -538,12 +557,23 @@ def _worker(opts, on_done):
         _set(phase="сбор источников", message="читаю публичные списки")
         _log("старт: режим=%s, глубокая проверка=%s" % (mode, "да" if deep else "нет"))
         cands = _collect_sources(opts)
+        if _cancel_requested():
+            return
 
         if mode == "internet":
             _set(phase="обход сайтов", message="ищу серверы на публичных страницах")
             cands.extend(_collect_web(opts))
+            if _cancel_requested():
+                return
 
         cands = _dedupe(cands)
+        existing = set(opts.get("existing") or [])
+        if existing:
+            before = len(cands)
+            cands = [s for s in cands if _variant_key(s) not in existing]
+            skipped = before - len(cands)
+            if skipped:
+                _log("уже есть в приложении: %d" % skipped)
         bad = [s for s in cands if not _ready(s)]
         if bad:
             cands = [s for s in cands if _ready(s)]
@@ -564,6 +594,9 @@ def _worker(opts, on_done):
         _set(alive=len(alive), message="TCP-живых: %d" % len(alive))
         _log("TCP-живых: %d из %d" % (len(alive), len(cands)))
 
+        if _cancel_requested():
+            return
+
         working = []
         if deep and alive:
             limit = int(opts.get("deep_limit") or DEFAULT_DEEP_LIMIT)
@@ -575,9 +608,13 @@ def _worker(opts, on_done):
                     sum(1 for s in sample if s.get("type") not in SHARE_TYPES)))
             from concurrent.futures import ThreadPoolExecutor, as_completed
             done = 0
+            cancelled = False
             with ThreadPoolExecutor(max_workers=DEFAULT_DEEP_WORKERS) as ex:
                 futs = {ex.submit(_deep_one, s): s for s in sample}
                 for fut in as_completed(futs):
+                    if _CANCEL.is_set():
+                        cancelled = True
+                        break
                     s = futs[fut]
                     try:
                         ok, _err = fut.result()
@@ -590,12 +627,19 @@ def _worker(opts, on_done):
                         _set(working=len(working),
                              message="проверено %d/%d, рабочих %d" % (done, len(sample), len(working)))
                         _log("проверено %d/%d, рабочих %d" % (done, len(sample), len(working)))
+            if cancelled:
+                working = []
+                _log("глубокая проверка остановлена, результаты не добавляются")
+                _set(phase="остановлено", message="сбор остановлен", finished=time.time())
+                return
         else:
-            # без глубокой проверки оставляем только TCP-живые
-            working = alive
-            for s in working:
+            # Без глубокой проверки нельзя добавлять узлы в приложение:
+            # TCP-доступность ничего не говорит о рабочем прокси.
+            for s in alive:
                 s["tested"] = False
                 s["latency_ok"] = False
+            _set(phase="готово", message="проверка без sing-box: найдено TCP-живых %d, в приложение не добавляю" % len(alive))
+            _log("глубокая проверка выключена: TCP-живых %d, в приложение не добавляю" % len(alive))
 
         if working:
             before = len(working)
@@ -630,8 +674,18 @@ def _worker(opts, on_done):
             _STATE["finished"] = _STATE["finished"] or time.time()
 
 
+def stop():
+    """Запросить остановку текущего сбора (проверяется между этапами)."""
+    _CANCEL.set()
+    with _LOCK:
+        if _STATE.get("running"):
+            _STATE["message"] = "останавливаю..."
+    _log("запрошена остановка сбора")
+
+
 def start(opts, on_done):
     """Запускает сбор в фоне. Возвращает (ok, error)."""
+    _CANCEL.clear()
     with _LOCK:
         if _STATE["running"]:
             return False, "сбор уже выполняется"
