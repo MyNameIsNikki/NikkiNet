@@ -18,6 +18,7 @@ import html
 import ipaddress
 import json
 import re
+import socket
 import time
 import urllib.error
 import urllib.parse
@@ -147,6 +148,9 @@ def fetch(url, timeout=15.0, max_bytes=2000000):
     })
     try:
         with _opener().open(req, timeout=timeout) as resp:
+            final_url = resp.geturl()
+            if not _safe_public_url(final_url):
+                return False, "", "", final_url, "запрещённый адрес после редиректа"
             ctype = (resp.headers.get("Content-Type") or "").split(";")[0].strip().lower()
             if ctype and not ctype.startswith(TEXT_TYPES):
                 return False, "", ctype, url, "content-type " + ctype

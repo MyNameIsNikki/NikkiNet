@@ -190,7 +190,7 @@ def load_state():
             if not isinstance(data, dict):
                 continue
             servers = data.get("servers")
-            if not isinstance(servers, list) or not servers:
+            if not isinstance(servers, list):
                 continue
             st = State()
             st.servers = [_norm_server(s) for s in servers]
@@ -213,8 +213,10 @@ def load_state():
             st.lan = _norm_lan(data.get("lan"))
             if not st.servers:
                 continue
-            if not st.server(st.active_server_id):
+            if st.servers and not st.server(st.active_server_id):
                 st.active_server_id = st.servers[0]["id"]
+            elif not st.servers:
+                st.active_server_id = ""
             if path != CONFIG_FILE:
                 print("load_state: восстановлен из %s" % path)
             return st
@@ -734,48 +736,6 @@ def startup_proxy_rollback(state):
 _sub_inflight = set()
 
 
-def _cleanup_dead(state, orphan_min=30):
-    """Авто-очистка: мёртвые (протестированные и не отвечающие) и брошенные
-    непротестированные узлы подписок (тест потерян, напр. из-за перезапуска).
-    Активные (обновляющиеся прямо сейчас) подписки не трогаем."""
-    active = set()
-    with state.lock:
-        for x in state.subs:
-            if x["id"] in _sub_inflight:
-                active.add("sub:" + (x.get("name") or x["id"]))
-        before = len(state.servers)
-        prev_active = state.active_server_id
-        now = time.time()
-        keep = []
-        for s in state.servers:
-            if s.get("tested") and not s.get("latency_ok") and s.get("source") != "warp":
-                continue
-            if (not s.get("tested")
-                    and str(s.get("source", "")).startswith("sub:")
-                    and s.get("source") not in active
-                    and s.get("added_ts")
-                    and now - s["added_ts"] > orphan_min * 60):
-                continue
-            keep.append(s)
-        state.servers = keep
-        removed = before - len(keep)
-        active_removed = bool(prev_active) and removed and not state.server(prev_active)
-        if removed and active_removed:
-            alive = [x for x in state.servers if x.get("enabled")]
-            state.active_server_id = alive[0]["id"] if alive else ""
-    if removed:
-        # рестарт ядра нужен только если удалили АКТИВНЫЙ сервер:
-        # мёртвые outbound'ы в конфиге безвредны — до следующего штатного reload
-        if active_removed and state.reloader:
-            state.reloader.request()
-        try:
-            save_state(state)
-        except Exception:
-            pass
-        state.add_log("info", f"Авто-очистка: удалено нерабочих/брошенных серверов: {removed}")
-    return removed
-
-
 def _dedupe_key(s):
     return f"{s.get('type')}://{s.get('host')}:{s.get('port')}"
 
@@ -1121,16 +1081,49 @@ def _failover(state, reason=""):
         return False
     good.sort(key=lambda s: (0 if str(s.get("country") or "").upper() == cc else 1,
                              s.get("latency") or 10 ** 9))
-    best = good[0]
-    state.active_server_id = best["id"]
-    fast = False
-    if state.core and state.core.running:
-        try:
-            fast = core_mod.clash_set_selector(core_mod.outbound_tag(best))
-        except Exception:
-            fast = False
-    if not fast and state.reloader:
-        state.reloader.request(force=True)
+    previous = state.active_server_id
+    chosen = None
+    used_reload = False
+    for best in good[:3]:
+        state.active_server_id = best["id"]
+        fast = False
+        if state.core and state.core.running:
+            try:
+                fast = core_mod.clash_set_selector(core_mod.outbound_tag(best))
+            except Exception:
+                fast = False
+        if fast:
+            time.sleep(1.2)
+            if _proxy_probe():
+                chosen = best
+                break
+            state.add_log("warn", f"После переключения на {best.get('name')} трафик не идёт — пробую следующего")
+            continue
+        if state.core:
+            ok, msg = do_reload(state, force=True)
+            used_reload = True
+            if ok:
+                time.sleep(0.5)
+                if _proxy_probe():
+                    chosen = best
+                    break
+                state.add_log("warn", f"После перезапуска на {best.get('name')} трафик не идёт — пробую следующего")
+            else:
+                state.add_log("warn", f"Не удалось применить {best.get('name')}: {(msg or '')[:120]}")
+        else:
+            chosen = best
+            break
+    if chosen is None:
+        state.active_server_id = previous
+        if state.core and state.core.running and act:
+            try:
+                core_mod.clash_set_selector(core_mod.outbound_tag(act))
+            except Exception:
+                if state.reloader:
+                    state.reloader.request(force=True)
+        state.add_log("error", "Переключение не удалось: ни один кандидат не пропустил реальный трафик")
+        return False
+    best = chosen
     try:
         save_state(state)
     except Exception:
@@ -1139,7 +1132,7 @@ def _failover(state, reason=""):
     state.add_log(
         "info",
         f"Переключение на {best.get('name')} ({best.get('country')}, "
-        f"{best.get('latency')} мс){'' if fast else ' (перезапуск)'}")
+        f"{best.get('latency')} мс){' (перезапуск)' if used_reload else ''} — трафик проверен")
     return True
 
 
@@ -1313,42 +1306,54 @@ def _ai_scan_worker(state, limit):
         gemini_good = []
         tested = 0
         cancelled = False
-        with ThreadPoolExecutor(max_workers=6) as ex:
-            futures = {ex.submit(core_mod.ai_probe, s, 8): s for s in cands}
-            for future in as_completed(futures):
+        def run_one(s):
+            try:
+                return core_mod.ai_probe(s, 8)
+            except Exception as exc:
+                return {"ok": False, "error": str(exc)[:100]}
+
+        def handle(srv, res):
+            nonlocal tested
+            tested += 1
+            with _AI_SCAN_LOCK:
+                _AI_SCAN["tested"] = tested
+            if res.get("chatgpt"):
+                chat_good.append((res.get("latency_ms") or 10 ** 9, srv))
+            if res.get("gemini"):
+                gemini_good.append((res.get("latency_ms") or 10 ** 9, srv))
+            if res.get("ok"):
+                good.append((res.get("latency_ms") or 10 ** 9, srv))
                 with _AI_SCAN_LOCK:
-                    if _AI_SCAN.get("cancel"):
-                        cancelled = True
-                if cancelled:
-                    break
-                srv = futures[future]
-                tested += 1
-                try:
-                    res = future.result()
-                except Exception as exc:
-                    res = {"ok": False, "error": str(exc)[:100]}
-                with _AI_SCAN_LOCK:
-                    _AI_SCAN["tested"] = tested
-                if res.get("chatgpt"):
-                    chat_good.append((res.get("latency_ms") or 10 ** 9, srv))
-                if res.get("gemini"):
-                    gemini_good.append((res.get("latency_ms") or 10 ** 9, srv))
-                if res.get("ok"):
-                    good.append((res.get("latency_ms") or 10 ** 9, srv))
-                    with _AI_SCAN_LOCK:
-                        _AI_SCAN["good"] = len(good)
-                        _AI_SCAN["chat"] = len(chat_good)
-                        _AI_SCAN["gemini"] = len(gemini_good)
-                    _ai_scan_log(
-                        "подходит: %s (%s, %s:%s) chat=%s gemini=%s" % (
-                            srv.get("name") or srv.get("host"), srv.get("type"),
-                            srv.get("host"), srv.get("port"),
-                            "да" if res.get("chatgpt") else "нет",
-                            "да" if res.get("gemini") else "нет",
-                        )
+                    _AI_SCAN["good"] = len(good)
+                    _AI_SCAN["chat"] = len(chat_good)
+                    _AI_SCAN["gemini"] = len(gemini_good)
+                _ai_scan_log(
+                    "подходит: %s (%s, %s:%s) chat=%s gemini=%s" % (
+                        srv.get("name") or srv.get("host"), srv.get("type"),
+                        srv.get("host"), srv.get("port"),
+                        "да" if res.get("chatgpt") else "нет",
+                        "да" if res.get("gemini") else "нет",
                     )
-                if tested % 10 == 0:
-                    _ai_scan_log(f"проверено {tested}/{len(cands)}, найдено {len(good)}")
+                )
+
+        cancelled = False
+        for offset in range(0, len(cands), 6):
+            with _AI_SCAN_LOCK:
+                cancelled = bool(_AI_SCAN.get("cancel"))
+            if cancelled:
+                break
+            batch = cands[offset:offset + 6]
+            with ThreadPoolExecutor(max_workers=len(batch)) as ex:
+                results = list(ex.map(run_one, batch))
+            for srv, res in zip(batch, results):
+                handle(srv, res)
+            if tested % 10 == 0 or offset + len(batch) >= len(cands):
+                _ai_scan_log(f"проверено {tested}/{len(cands)}, найдено {len(good)}")
+        if cancelled:
+            with _AI_SCAN_LOCK:
+                _AI_SCAN["phase"] = "остановлено"
+            _ai_scan_log("подбор AI-сервера остановлен")
+            return
         if not good:
             with _AI_SCAN_LOCK:
                 _AI_SCAN["phase"] = "не найдено"
@@ -1601,6 +1606,36 @@ class AdminHandler(BaseHTTPRequestHandler):
             if res.get("ok"):
                 state.add_log("info", "Автосбор серверов запущен")
             return res
+
+        if p == "/api/state/import":
+            servers = b.get("servers")
+            if not isinstance(servers, list):
+                return {"ok": False, "error": "нужен список servers"}
+            with state.lock:
+                state.servers = [_norm_server(s) for s in servers if isinstance(s, dict)]
+                if isinstance(b.get("subs"), list):
+                    state.subs = b["subs"]
+                if isinstance(b.get("rules"), list):
+                    state.rules = b["rules"]
+                active = str(b.get("active_server_id") or "")
+                if not state.server(active):
+                    active = state.servers[0]["id"] if state.servers else ""
+                state.active_server_id = active
+                mode = str(b.get("selection_mode") or state.selection_mode)
+                state.selection_mode = mode if mode in ("manual", "auto") else "manual"
+                unmatched = str(b.get("unmatched") or state.unmatched)
+                state.unmatched = unmatched if unmatched in ("proxy", "direct", "block") else "proxy"
+                state.ai_mode = bool(b.get("ai_mode", state.ai_mode))
+                state.ai_server_id = str(b.get("ai_server_id") or "")
+                state.ai_chat_id = str(b.get("ai_chat_id") or "")
+                state.ai_gemini_id = str(b.get("ai_gemini_id") or "")
+                if isinstance(b.get("lan"), dict):
+                    state.lan = _norm_lan(b["lan"])
+            save_state(state)
+            ok, msg = do_reload(state, force=True) if state.core else (True, "ядро не инициализировано")
+            state.add_log("info", f"Импорт состояния: серверов {len(state.servers)}, активный {state.active_server_id or '—'}")
+            return {"ok": bool(ok), "servers": len(state.servers),
+                    "active_server_id": state.active_server_id, "error": "" if ok else msg[:250]}
 
         if p == "/api/server/add":
             servers = b.get("servers")

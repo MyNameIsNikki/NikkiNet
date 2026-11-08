@@ -409,11 +409,30 @@ def _fetch_source(item, per_source):
 def _collect_sources(opts):
     from concurrent.futures import ThreadPoolExecutor
     per = int(opts.get("per_source") or DEFAULT_PER_SOURCE)
-    todo = list(SOURCES)
+    stats = _load_stats()
+    todo = []
+    skipped = []
+    for item in SOURCES:
+        rec = stats.get(item[0]) or {}
+        try:
+            fails = int(rec.get("fail_streak") or 0)
+        except (TypeError, ValueError):
+            fails = 0
+        if fails >= 3:
+            skipped.append(item[0])
+        else:
+            todo.append(item)
+    if skipped:
+        _log("пропускаю источники с 3+ пустыми запусками: %s" % ", ".join(skipped[:8]))
     total = []
     with ThreadPoolExecutor(max_workers=8) as ex:
         results = list(ex.map(lambda it: _fetch_source(it, per), todo))
     for name, raw, err in results:
+        rec = stats.setdefault(name, {})
+        if err or not raw:
+            rec["fail_streak"] = int(rec.get("fail_streak") or 0) + 1
+        else:
+            rec["fail_streak"] = 0
         if err:
             _log("источник %s: ошибка %s" % (name, err))
             continue
@@ -424,6 +443,7 @@ def _collect_sources(opts):
                 norm.append(s)
         _log("источник %s: %d" % (name, len(norm)))
         total.extend(norm)
+    _save_stats(stats)
     return total
 
 
